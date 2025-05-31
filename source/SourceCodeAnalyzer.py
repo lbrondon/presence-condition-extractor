@@ -1,21 +1,40 @@
+"""
+Module for analyzing C source code to locate function definitions.
+
+This utility reads a C source file and provides functionality to search
+for the definition of a specific function based on pattern matching.
+
+Classes:
+    SourceCodeAnalyzer -- Provides methods for parsing and locating C functions.
+"""
+
 import re
 from typing import Optional
 
 class SourceCodeAnalyzer:
     """
-    Analyzes C source files to locate function definitions.
+    Analyzes C source files to locate function definitions using regular expressions.
     """
 
     def __init__(self, source_code_path: str):
         """
-        Initialize with the path to the source file.
+        Initializes the analyzer with a given C source file path.
+
+        Args:
+            source_code_path (str): Path to the C source file.
         """
         self.source_code_path = source_code_path
         self.source_code = self._load_source_code()
 
     def _load_source_code(self) -> str:
         """
-        Read and return the content of the source file.
+        Loads the entire content of the C source file.
+
+        Returns:
+            str: Contents of the file as a string.
+
+        Raises:
+            Exception: If the file cannot be read.
         """
         try:
             with open(self.source_code_path, 'r') as file:
@@ -26,7 +45,14 @@ class SourceCodeAnalyzer:
 
     def find_function_definition(self, function_name: str) -> Optional[re.Match]:
         """
-        Locate the definition of the given function in the source code.
+        Searches for the definition of a specified function in the loaded source code.
+
+        Args:
+            function_name (str): Name of the function to search for.
+
+        Returns:
+            Optional[re.Match]: Match object representing the function declaration,
+            or None if the function is not found.
         """
         pattern = rf'^\s*[\w\s\*]+{function_name}\s*\(.*?\)\s*\{{'
         match = re.search(pattern, self.source_code, re.MULTILINE | re.DOTALL)
