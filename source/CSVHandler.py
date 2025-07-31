@@ -1,60 +1,70 @@
 import pandas as pd
-from typing import Optional
+from typing import Optional, List
+import logging
 
 class CSVHandler:
     """
-    A utility class for managing CSV file input and output operations using pandas.
+    Classe utilitária para operações robustas de entrada e saída com arquivos CSV,
+    utilizando pandas como backend de processamento tabular.
 
-    This class encapsulates methods to load a CSV file into a DataFrame and to persist
-    that DataFrame to disk. It is designed to abstract file handling operations and ensure
-    robust error reporting during I/O tasks.
+    Esta abstração provê métodos para carregar e salvar DataFrames, encapsulando
+    detalhes de tratamento de exceções e integrando com o sistema de logging da aplicação.
     """
 
     def __init__(self, csv_path: str):
         """
-        Initializes the CSVHandler with the path to the target CSV file.
+        Inicializa o gerenciador com o caminho do arquivo CSV.
 
         Args:
-            csv_path (str): Absolute or relative path to the CSV file.
+            csv_path (str): Caminho absoluto ou relativo do arquivo CSV.
         """
         self.csv_path = csv_path
         self.dataframe: Optional[pd.DataFrame] = None
 
-    def load_csv(self) -> pd.DataFrame:
+    def load_csv(self, required_columns: Optional[List[str]] = None) -> pd.DataFrame:
         """
-        Loads the contents of the CSV file into a pandas DataFrame.
+        Carrega o conteúdo de um arquivo CSV em um DataFrame pandas.
+
+        Args:
+            required_columns (List[str], opcional): Lista de colunas esperadas para validação.
 
         Returns:
-            pd.DataFrame: DataFrame populated with the contents of the CSV file.
+            pd.DataFrame: O DataFrame populado com os dados do arquivo CSV.
 
         Raises:
-            IOError: If the file cannot be read or parsed by pandas.
+            IOError: Em caso de falha de leitura.
+            ValueError: Caso colunas esperadas não estejam presentes.
         """
         try:
-            self.dataframe = pd.read_csv(self.csv_path)
-            print(f"CSV loaded successfully with {len(self.dataframe)} entries.")
-            return self.dataframe
+            df = pd.read_csv(self.csv_path)
+            if required_columns:
+                missing = [col for col in required_columns if col not in df.columns]
+                if missing:
+                    raise ValueError(f"CSV file is missing required columns: {missing}")
+            self.dataframe = df
+            logging.info(f"CSV carregado com sucesso: {self.csv_path} ({len(df)} linhas)")
+            return df
         except Exception as e:
-            print(f"Error loading CSV: {e}")
-            raise IOError(f"Failed to load CSV file: {e}")
+            logging.error(f"Erro ao carregar CSV: {e}")
+            raise IOError(f"Falha ao carregar o arquivo CSV: {e}")
 
     def save_csv(self, output_path: str):
         """
-        Saves the current DataFrame to the specified output file path.
+        Salva o DataFrame corrente no caminho especificado.
 
         Args:
-            output_path (str): Destination path where the CSV file will be written.
+            output_path (str): Caminho de destino para salvar o CSV.
 
         Raises:
-            ValueError: If no DataFrame is loaded before calling save.
-            IOError: If the file cannot be written to the specified path.
+            ValueError: Caso não haja DataFrame em memória.
+            IOError: Em caso de falha na escrita do arquivo.
         """
         if self.dataframe is not None:
             try:
                 self.dataframe.to_csv(output_path, index=False)
-                print(f"CSV saved successfully to: {output_path}")
+                logging.info(f"CSV salvo com sucesso: {output_path}")
             except Exception as e:
-                print(f"Error saving CSV: {e}")
-                raise IOError(f"Failed to save CSV file: {e}")
+                logging.error(f"Erro ao salvar CSV: {e}")
+                raise IOError(f"Falha ao salvar o arquivo CSV: {e}")
         else:
-            raise ValueError("No data to save. Load a CSV first.")
+            raise ValueError("Nenhum DataFrame carregado. Use load_csv() primeiro.")

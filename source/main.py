@@ -1,25 +1,10 @@
-"""
-Main script for extracting presence conditions from C source files.
-
-This script reads project metadata from a CSV file, analyzes the C source files
-to identify the presence conditions under which a callee function is invoked
-from a caller function, and writes the results to an output CSV.
-
-Modules:
-    - CSVHandler: Handles loading and saving of CSV project metadata.
-    - SourceCodeAnalyzer: Extracts raw source code from C files.
-    - PresenceConditionExtractor: Analyzes preprocessor directives to infer conditions.
-
-Typical usage example:
-    python main.py
-"""
-
 from CSVHandler import CSVHandler
 from SourceCodeAnalyzer import SourceCodeAnalyzer
 from PresenceConditionExtractor import PresenceConditionExtractor
 
 import os
 import logging
+import pandas as pd
 
 # Logging configuration for detailed runtime diagnostics
 logging.basicConfig(
@@ -41,15 +26,18 @@ def main():
     # Load input metadata
     csv_handler = CSVHandler(input_csv_path)
     dataframe = csv_handler.load_csv()
-    dataframe['PC'] = 'UNDEFINED'  # Default placeholder for presence conditions
-    
+
+    # Remove duplicated caller-callee entries to avoid redundant PC extraction
+    dataframe = dataframe.drop_duplicates(subset=['Project', 'File', 'Caller', 'Callee'])
+    updated_rows = []
+
     # Iterate over each row to process corresponding source files
     for index, row in dataframe.iterrows():
         project = row['Project']
         file_name = row['File']
         caller = row['Caller']
         callee = row['Callee']
-        
+
         source_code_path = os.path.join(base_directory, project, file_name)
         logging.info(f"Processing file: {source_code_path}, Caller: {caller}, Callee: {callee}")
         
@@ -58,20 +46,28 @@ def main():
             source_code = analyzer.source_code
 
             extractor = PresenceConditionExtractor(source_code)
-            pc = extractor.extract_pc_from_caller_context(caller, callee)
-            dataframe.at[index, 'PC'] = pc
+            pcs = extractor.extract_pc_from_caller_context(caller, callee)
 
-            logging.info(f"{caller} → {callee} → PC: {pc}")
+            for pc in pcs:
+                new_row = row.copy()
+                new_row['PC'] = pc
+                updated_rows.append(new_row)
+
+            for pc in pcs:
+                logging.info(f"{caller} → {callee} → PC: {pc}")
 
         except FileNotFoundError:
             logging.error(f"File not found: {source_code_path}")
-            dataframe.at[index, 'PC'] = 'FILE_NOT_FOUND'
+            row['PC'] = 'FILE_NOT_FOUND'
+            updated_rows.append(row)
         except Exception as e:
             logging.exception(f"Error processing file {source_code_path}: {e}")
-            dataframe.at[index, 'PC'] = f'ERROR: {str(e)}'
+            row['PC'] = f'ERROR: {str(e)}'
+            updated_rows.append(row)
     
     # Save the updated results
-    csv_handler.dataframe = dataframe
+    result_df = pd.DataFrame(updated_rows)
+    csv_handler.dataframe = result_df
     csv_handler.save_csv(output_csv_path)
     logging.info(f"Processing completed. Output saved to: {output_csv_path}")
 
