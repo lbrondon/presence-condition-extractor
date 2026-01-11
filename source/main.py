@@ -1,328 +1,329 @@
 """
-Main entry point for batch extraction of presence conditions (PCs).
+main.py — Batch driver for presence-condition (PC) extraction.
 
-This script:
-  1) Loads (Project, File, Caller, Callee) tuples from a CSV.
-  2) Resolves each source path robustly against the local projects tree.
-  3) Parses the corresponding C file and extracts the presence condition(s)
-     under which the given callee is invoked inside the specified caller.
-  4) Emits the results to a CSV, expanding rows when multiple call sites exist.
+This script reads an input CSV with columns:
+    Project, File, Caller, Callee
 
-Design notes:
-  • Path resolution is intentionally defensive (handles absolute/relative
-    paths, slashes, and slightly diverging layouts), with a final fallback
-    based on suffix matching within a project tree.
-  • The pipeline tolerates duplicates in the input CSV; it de-duplicates
-    output rows by (Project, File, Caller, Callee, PC).
-  • “Pseudo-callees” such as `defined` (not real function calls) are dropped.
+For each row, it:
+  1) Resolves the C source path inside the local `projects/` directory.
+  2) Loads the file contents.
+  3) Extracts the presence condition(s) under which `callee` is called inside `caller`.
+  4) Writes the output CSV with an additional `PC` column.
+
+Output schema:
+    Project, File, Caller, Callee, PC
+
+Notes
+-----
+- If a call site is not under any preprocessor condition, PC must be "TRUE".
+- If the file cannot be located, PC is "FILE_NOT_FOUND".
+- If the caller function cannot be located, PC is "CALLER_NOT_FOUND".
+- If the callee call cannot be located inside the caller bounds, PC is "CALL_NOT_FOUND".
 """
 
-from CSVHandler import CSVHandler
-from SourceCodeAnalyzer import SourceCodeAnalyzer
-from PresenceConditionExtractor import PresenceConditionExtractor
+from __future__ import annotations
 
-import os
+import argparse
 import logging
-import pandas as pd
+import os
 from functools import lru_cache
+from typing import Dict, List, Tuple
 
-# ---------------------------------------------------------------------------
-# Logging configuration
-# ---------------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+import pandas as pd
 
-# ---------------------------------------------------------------------------
-# Path utilities
-# ---------------------------------------------------------------------------
+from CSVHandler import CSVHandler
+from PresenceConditionExtractor import PresenceConditionExtractor
+from SourceCodeAnalyzer import SourceCodeAnalyzer
+
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+
+# -----------------------------------------------------------------------------
+# Path normalization & resolution
+
+def _is_regular_file(path: str) -> bool:
+    """Return True iff `path` exists and is a regular file (not a directory)."""
+    try:
+        return os.path.isfile(path)
+    except OSError:
+        return False
+
+# -----------------------------------------------------------------------------
 def _normalize_csv_path(path_str: str) -> str:
     """
-    Normalize a path value coming from CSV.
+    Normalize a path string from the CSV.
 
-    Behavior:
-      - Trims whitespace.
-      - Converts backslashes to forward slashes.
-      - Removes leading './' segments.
-      - Leaves a leading '/' intact to preserve absolute-path semantics.
-
-    Parameters
-    ----------
-    path_str : str
-        Raw path string from the CSV.
-
-    Returns
-    -------
-    str
-        Normalized path string (may be empty when input is None).
+    Steps:
+      - Trim whitespace.
+      - Convert backslashes to forward slashes.
+      - Remove leading './' segments.
+      - Preserve leading '/' to keep absolute-path semantics.
     """
     if path_str is None:
         return ""
-    p = str(path_str).strip().replace('\\', '/')
-    while p.startswith('./'):
+    p = str(path_str).strip().replace("\\", "/")
+    while p.startswith("./"):
         p = p[2:]
-    if p.startswith('/'):
-        # Keep leading '/' so that POSIX absolute paths remain recognizable.
-        return p
     return p
 
 
 @lru_cache(maxsize=256)
-def _build_project_index(project_root: str):
+def _build_project_index(project_root: str, exts: Tuple[str, ...] = (".c",)) -> Dict[str, List[str]]:
     """
-    Build a lightweight index of all .c files under a project directory.
+    Build an index of all source files under `project_root`, keyed by basename.
 
-    The index maps a basename (e.g., 'foo.c') to a list of absolute paths for
-    files with that name. Used as a last-resort fallback when straightforward
-    joins fail to locate a source file.
+    Example:
+      index["multi.c"] -> ["/.../curl/lib/multi.c", "/.../curl/tests/multi.c", ...]
 
-    Parameters
-    ----------
-    project_root : str
-        Absolute path to the project root directory.
-
-    Returns
-    -------
-    dict[str, list[str]]
-        Mapping from filename to candidate absolute paths.
+    This index is a *fallback* when direct path joins fail (layout divergence).
     """
-    index = {}
+    index: Dict[str, List[str]] = {}
     if not os.path.isdir(project_root):
         return index
+
     for root, _, files in os.walk(project_root):
-        for f in files:
-            # Restrict to .c files; adjust if you need to cover headers or other extensions.
-            if f.endswith('.c'):
-                full = os.path.join(root, f)
-                index.setdefault(f, []).append(full)
+        for fname in files:
+            if any(fname.endswith(ext) for ext in exts):
+                full = os.path.join(root, fname)
+                index.setdefault(fname, []).append(full)
     return index
 
 
-def _best_suffix_match(candidates, desired_rel_like: str) -> str:
+def _best_suffix_match(candidates: List[str], desired_rel_like: str) -> str:
     """
-    Choose the candidate whose suffix best matches the desired relative path.
-
-    Rationale
-    ---------
-    When a CSV path slightly diverges from the actual layout (e.g., additional
-    directories, renamed roots), a longest-common-suffix match over path
-    components is robust in practice.
-
-    Parameters
-    ----------
-    candidates : list[str]
-        Absolute paths discovered in the project index for a given basename.
-    desired_rel_like : str
-        The 'desired' path (as it appears in the CSV), treated as a relative-like string.
-
-    Returns
-    -------
-    str
-        The best-matching absolute path (empty string when no candidates).
+    Select the candidate path whose suffix (path components from the end)
+    matches the desired CSV path with the greatest overlap.
     """
     if not candidates:
         return ""
-    desired = desired_rel_like.replace('\\', '/').strip('/')
+
+    desired = desired_rel_like.replace("\\", "/").strip("/")
 
     def score(path: str) -> int:
-        comps_a = path.replace('\\', '/').split('/')
-        comps_b = desired.split('/')
+        comps_a = path.replace("\\", "/").split("/")
+        comps_b = desired.split("/")
         i = 1
         while i <= min(len(comps_a), len(comps_b)) and comps_a[-i] == comps_b[-i]:
             i += 1
-        return i - 1  # number of equal components from the end
+        return i - 1
 
     return max(candidates, key=score)
 
 
-def resolve_source_path(base_dir: str, project: str, file_field: str) -> str:
+def resolve_source_path(projects_dir: str, project: str, file_field: str) -> str:
     """
-    Resolve an absolute filesystem path for a source file using robust rules:
+    Resolve the absolute filesystem path for a source file described by the CSV.
 
-      1) If `file_field` is absolute, return it when it exists.
-      2) If `file_field` starts with the project name, join as base_dir / file_field.
-      3) Otherwise try base_dir / project / file_field.
-      4) Try base_dir / file_field (for CSVs that already include 'project/').
-      5) Fallback: search by basename within base_dir/project and pick
-         the best suffix match.
+    The input CSV is often inconsistent across datasets:
+      - Some rows store File="lib/multi.c"
+      - Others store File="curl/lib/multi.c"
+      - Some datasets include deeper nesting due to repository layout changes.
 
-    Parameters
-    ----------
-    base_dir : str
-        Absolute path to the root directory containing projects.
-    project : str
-        Project ID/name (used in path reconstruction and fallback search).
-    file_field : str
-        Path string from the CSV's 'File' column.
+    Resolution strategy (in order):
+      1) If `File` is absolute, accept it if it exists.
+      2) Try: projects_dir / project / File
+      3) Try: projects_dir / File
+      4) If File starts with "<project>/", also try: projects_dir / project / File
+         (this covers layouts like projects/curl/curl/...).
+      5) Fallback: basename search inside projects_dir/project, best suffix match.
 
-    Returns
-    -------
-    str
-        Resolved absolute path, or empty string when not found.
+    Returns:
+      Absolute path if found, else "".
     """
     ff = _normalize_csv_path(file_field)
+    project = str(project).strip()
 
-    # Absolute path?
+    if not ff:
+        return ""
+
+    # (1) Absolute
     if os.path.isabs(ff):
-        return ff if os.path.exists(ff) else ""
+        return ff if _is_regular_file(ff) else ""
 
-    # If CSV already starts with the project name, do not duplicate it
-    first_comp = ff.split('/')[0] if ff else ""
+    # Candidate list (keep order: most plausible first)
+    candidates: List[str] = []
+
+    # (2) projects_dir / project / ff  (typical)
+    candidates.append(os.path.join(projects_dir, project, ff))
+
+    # (3) projects_dir / ff  (File already includes project prefix)
+    candidates.append(os.path.join(projects_dir, ff))
+
+    # (4) If ff already starts with "<project>/", attempt double nesting:
+    #     projects/curl/curl/...
+    first_comp = ff.split("/")[0]
     if first_comp == project:
-        p = os.path.join(base_dir, ff)
-        if os.path.exists(p):
+        candidates.append(os.path.join(projects_dir, project, ff))
+
+    for p in candidates:
+        if _is_regular_file(p):
             return p
 
-    # Try base_dir / project / ff
-    p = os.path.join(base_dir, project, ff)
-    if os.path.exists(p):
-        return p
-
-    # Try base_dir / ff (CSV may already include 'project/')
-    p = os.path.join(base_dir, ff)
-    if os.path.exists(p):
-        return p
-
-    # Fallback: index & suffix match within the project
-    project_root = os.path.join(base_dir, project)
-    index = _build_project_index(project_root)
+    # (5) Fallback: search by basename within the project directory
+    project_root = os.path.join(projects_dir, project)
+    index = _build_project_index(project_root, exts=(".c",))
     tail = os.path.basename(ff)
     cands = index.get(tail, [])
     if cands:
         best = _best_suffix_match(cands, ff)
-        if best and os.path.exists(best):
+        if best and _is_regular_file(best):
             logging.warning(f"[PathResolver] Fallback matched by suffix: '{ff}' → '{best}'")
             return best
 
-    # Not found
     return ""
 
 
-# ---------------------------------------------------------------------------
-# Batch driver
-# ---------------------------------------------------------------------------
-def main():
-    """
-    Batch driver that orchestrates:
-      • CSV loading and validation,
-      • path resolution for each row,
-      • PC extraction for (caller, callee) pairs,
-      • multi-call expansion and de-duplication,
-      • and final CSV persistence.
-    """
-    input_csv_path = 'projects_cs.csv'  # adjust as needed for your dataset
-    base_directory = '/home/lucas/Documents/presence_condition_extractor/projects'
-    output_csv_path = '/home/lucas/Documents/presence_condition_extractor/output/projects_with_pc.csv'
+# -----------------------------------------------------------------------------
+# Main pipeline
+# -----------------------------------------------------------------------------
+def _repo_root_from_this_file() -> str:
+    """Return repository root as: <root>/source/main.py -> <root>."""
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 
-    logging.info(f"Starting CSV processing: {input_csv_path}")
+
+def _default_paths() -> Tuple[str, str, str]:
+    """
+    Compute robust default paths relative to the repository root:
+
+      <root>/projects
+      <root>/output
+      <root>/projects_cs.csv  (if you keep it in root)
+      or <root>/source/projects_cs.csv (if you keep it in source)
+    """
+    root = _repo_root_from_this_file()
+
+    projects_dir = os.path.join(root, "projects")
+    output_dir = os.path.join(root, "output")
+
+    # Prefer root/projects_cs.csv; fallback to source/projects_cs.csv
+    input_csv_root = os.path.join(root, "cs_projects.csv")
+    input_csv_source = os.path.join(root, "source", "cs_projects.csv")
+    input_csv = input_csv_root if os.path.exists(input_csv_root) else input_csv_source
+
+    return input_csv, projects_dir, output_dir
+
+
+def _is_pseudo_callee(callee: str) -> bool:
+    """
+    Heuristic filter for CSV noise.
+
+    - `defined` appears when the upstream call extractor mistakenly treats
+      `defined(MACRO)` as a call target.
+    - Empty callee fields are also possible in noisy datasets.
+    """
+    if not callee:
+        return True
+    return callee.strip().lower() in {"defined"}
+
+
+def main() -> None:
+    input_csv_default, projects_dir_default, output_dir_default = _default_paths()
+
+    parser = argparse.ArgumentParser(description="Extract presence conditions for caller→callee pairs.")
+    parser.add_argument("--input", default=input_csv_default, help="Input CSV with Project,File,Caller,Callee.")
+    parser.add_argument("--projects", default=projects_dir_default, help="Directory containing all projects.")
+    parser.add_argument("--output", default=os.path.join(output_dir_default, "cs_projects__with_pc.csv"),
+                        help="Output CSV path.")
+    args = parser.parse_args()
+
+    input_csv_path = args.input
+    projects_dir = args.projects
+    output_csv_path = args.output
+
+    os.makedirs(os.path.dirname(output_csv_path), exist_ok=True)
+
+    logging.info(f"Input CSV: {input_csv_path}")
+    logging.info(f"Projects dir: {projects_dir}")
+    logging.info(f"Output CSV: {output_csv_path}")
+
     csv_handler = CSVHandler(input_csv_path)
     df = csv_handler.load_csv()
 
-    # Validate required columns early to fail fast on malformed inputs.
-    for col in ['Project', 'File', 'Caller', 'Callee']:
+    required_cols = ["Project", "File", "Caller", "Callee"]
+    for col in required_cols:
         if col not in df.columns:
             raise KeyError(f"Missing required column in CSV: {col}")
 
-    # Initialize output column with a sentinel.
-    df['PC'] = 'UNDEFINED'
+    # Initialize output column
+    df["PC"] = "UNDEFINED"
 
-    # (1) Filter out pseudo-callees (e.g., 'defined'), which are not real calls.
-    to_drop_idx = []
-    PSEUDO_CALLEES = {'defined'}  # extend if needed
+    # Drop pseudo-callee noise early (keeps output cleaner and faster)
+    before_drop = len(df)
+    df = df[~df["Callee"].astype(str).map(_is_pseudo_callee)].copy()
+    df.reset_index(drop=True, inplace=True)
+    if len(df) != before_drop:
+        logging.info(f"Dropped {before_drop - len(df)} pseudo-callee/noise rows.")
+
+    # Cache loaded source code per absolute file path (big speedup in large datasets)
+    source_cache: Dict[str, str] = {}
+
+    # Cache extraction results per (abs_path, caller, callee)
+    pc_cache: Dict[Tuple[str, str, str], List[str]] = {}
+
+    # Collect extra rows when a caller contains multiple call sites for the same callee
+    extra_rows: List[pd.Series] = []
+
     for idx, row in df.iterrows():
-        callee = str(row['Callee']).strip()
-        if callee.lower() in PSEUDO_CALLEES:
-            to_drop_idx.append(idx)
-    if to_drop_idx:
-        logging.info(f"Dropping {len(to_drop_idx)} pseudo-callee rows (e.g., 'defined').")
-        df.drop(index=to_drop_idx, inplace=True)
-        df.reset_index(drop=True, inplace=True)
+        project = str(row["Project"]).strip()
+        file_field = str(row["File"]).strip()
+        caller = str(row["Caller"]).strip()
+        callee = str(row["Callee"]).strip()
 
-    # (2) Caches to avoid recomputation and duplicate emission
-    result_cache = {}   # (project, abs_path, caller, callee) -> List[str]
-    emitted_keys = set()
-    extra_rows = []     # additional rows for multiple call sites
-
-    # Main extraction loop
-    for idx, row in df.iterrows():
-        project = str(row['Project']).strip()
-        file_name = str(row['File']).strip()
-        caller = str(row['Caller']).strip()
-        callee = str(row['Callee']).strip()
-
-        abs_path = resolve_source_path(base_directory, project, file_name)
+        abs_path = resolve_source_path(projects_dir, project, file_field)
         logging.info(f"Processing file: {abs_path or '[NOT FOUND]'}, Caller: {caller}, Callee: {callee}")
 
-        if not abs_path or not os.path.exists(abs_path):
-            logging.error(f"File not found (after resolution attempts): {project} :: {file_name}")
-            df.at[idx, 'PC'] = 'FILE_NOT_FOUND'
+        if not abs_path or not _is_regular_file(abs_path):
+            logging.error(f"File not found (after resolution attempts): {project} :: {file_field}")
+            df.at[idx, "PC"] = "FILE_NOT_FOUND"
             continue
 
-        key = (project, abs_path, caller, callee)
-
-        # If we already emitted this (Project, Path, Caller, Callee), mark this row to drop later.
-        if key in emitted_keys:
-            df.at[idx, 'PC'] = '__DUP_TO_DROP__'
-            continue
-
-        # Compute (or reuse) PCs for this key.
-        try:
-            if key not in result_cache:
+        # Load source (cached)
+        if abs_path not in source_cache:
+            try:
                 analyzer = SourceCodeAnalyzer(abs_path)
-                extractor = PresenceConditionExtractor(analyzer.source_code)
-                pcs = extractor.extract_pc_from_caller_context(caller, callee)
-                if isinstance(pcs, str):
-                    pcs = [pcs]
-                if not pcs:
-                    pcs = ['CALL_NOT_FOUND']
-                result_cache[key] = pcs
-            else:
-                pcs = result_cache[key]
+            except IsADirectoryError:
+                logging.error(f"Path is a directory (skipping): {abs_path}")
+                df.at[idx, "PC"] = "FILE_NOT_FOUND"
+                continue
+            source_cache[abs_path] = analyzer.source_code
 
-            emitted_keys.add(key)
+        cache_key = (abs_path, caller, callee)
+        if cache_key not in pc_cache:
+            extractor = PresenceConditionExtractor(source_cache[abs_path])
+            pcs = extractor.extract_pc_from_caller_context(caller, callee)
+            if isinstance(pcs, str):
+                pcs = [pcs]
+            if not pcs:
+                pcs = ["CALL_NOT_FOUND"]
+            pc_cache[cache_key] = pcs
 
-            # Place the first PC on the current row
-            df.at[idx, 'PC'] = pcs[0]
-            logging.info(f"{caller} → {callee} → PC[0]: {pcs[0]}")
+        pcs = pc_cache[cache_key]
 
-            # Emit additional PCs (when multiple call sites exist) as synthetic rows
-            for extra_pc in pcs[1:]:
-                new_row = row.copy()
-                new_row['PC'] = extra_pc
-                extra_rows.append(new_row)
-                logging.info(f"{caller} → {callee} → PC[extra]: {extra_pc}")
+        # First PC in the original row
+        df.at[idx, "PC"] = pcs[0]
 
-        except FileNotFoundError:
-            logging.error(f"File not found while reading: {abs_path}")
-            df.at[idx, 'PC'] = 'FILE_NOT_FOUND'
-        except Exception as e:
-            logging.exception(f"Error processing file {abs_path}: {e}")
-            df.at[idx, 'PC'] = f'ERROR: {str(e)}'
+        # Remaining PCs become additional rows
+        for pc in pcs[1:]:
+            new_row = row.copy()
+            new_row["PC"] = pc
+            extra_rows.append(new_row)
 
-    # Drop “already emitted” placeholders
-    if '__DUP_TO_DROP__' in df['PC'].values:
-        df = df[df['PC'] != '__DUP_TO_DROP__'].copy()
-
-    # Append extra rows (multi-call expansion) and de-duplicate final output
+    # Append extra rows (multi-call expansion)
     if extra_rows:
         df = pd.concat([df, pd.DataFrame(extra_rows)], ignore_index=True)
 
-    before = len(df)
-    df.drop_duplicates(subset=['Project', 'File', 'Caller', 'Callee', 'PC'], inplace=True, keep='first')
+    # De-duplicate final output
+    df.drop_duplicates(subset=["Project", "File", "Caller", "Callee", "PC"], inplace=True, keep="first")
     df.reset_index(drop=True, inplace=True)
-    after = len(df)
-    if after != before:
-        logging.info(f"Drop duplicates: {before - after} rows removed")
 
-    # Persist results
     csv_handler.dataframe = df
     csv_handler.save_csv(output_csv_path)
-    logging.info(f"Processing completed. Output saved to: {output_csv_path}")
+
+    logging.info("Extraction completed successfully.")
 
 
-# ---------------------------------------------------------------------------
-# Entrypoint
-# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     main()

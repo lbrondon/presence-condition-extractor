@@ -1,359 +1,590 @@
 import re
-from typing import List, Optional, Tuple
+from dataclasses import dataclass
+from typing import List, Tuple, Optional, Dict
+
+
+# ----------------------------
+# Helpers: expression handling
+# ----------------------------
+
+_DEFINED_PAREN_RE = re.compile(r"\bdefined\s*\(\s*([A-Za-z_]\w*)\s*\)")
+_DEFINED_BARE_RE  = re.compile(r"\bdefined\s+([A-Za-z_]\w*)\b")
+
+def _normalize_defined(expr: str) -> str:
+    """
+    Normalize 'defined(X)' and 'defined X' to 'X' (CPP boolean atom),
+    preserving explicit negations like '!defined(X)' -> '!X'.
+    """
+    e = expr.strip()
+    # First normalize "defined(X)" -> "X"
+    e = _DEFINED_PAREN_RE.sub(r"\1", e)
+    # Then normalize "defined X" -> "X"
+    e = _DEFINED_BARE_RE.sub(r"\1", e)
+    # Normalize "! defined(X)" forms (after defined normalization it may become "!X" already)
+    e = re.sub(r"!\s+", "!", e)
+    # Collapse whitespace
+    e = re.sub(r"\s+", " ", e).strip()
+    return e
+
+
+def _paren_wrap(expr: str) -> str:
+    expr = expr.strip()
+    if not expr:
+        return expr
+    # Avoid double parentheses in trivial cases; still safe to wrap.
+    return f"({expr})"
+
+
+def _neg(expr: str) -> str:
+    """
+    Logical negation with parentheses to preserve precedence.
+    """
+    expr = expr.strip()
+    if not expr:
+        return "!(/*empty*/)"
+    return f"!{_paren_wrap(expr)}"
+
+
+def _and_all(parts: List[str]) -> str:
+    parts = [p.strip() for p in parts if p and p.strip()]
+    if not parts:
+        return "TRUE"
+    if len(parts) == 1:
+        return parts[0]
+    return " && ".join(parts)
+
+
+# -----------------------------------------
+# Phase A: sanitize comments/strings (safe)
+# -----------------------------------------
+
+def _sanitize_c_text(text: str) -> str:
+    """
+    Remove C comments and string/char literals by replacing characters with spaces,
+    preserving newlines and overall layout (line numbers remain stable).
+
+    This prevents braces/parentheses inside comments/strings from breaking scans.
+    """
+    out = []
+    i = 0
+    n = len(text)
+
+    IN_NONE = 0
+    IN_LINE_COMMENT = 1
+    IN_BLOCK_COMMENT = 2
+    IN_STRING = 3
+    IN_CHAR = 4
+
+    state = IN_NONE
+    while i < n:
+        c = text[i]
+
+        if state == IN_NONE:
+            if c == "/" and i + 1 < n and text[i + 1] == "/":
+                state = IN_LINE_COMMENT
+                out.append(" ")
+                out.append(" ")
+                i += 2
+                continue
+            if c == "/" and i + 1 < n and text[i + 1] == "*":
+                state = IN_BLOCK_COMMENT
+                out.append(" ")
+                out.append(" ")
+                i += 2
+                continue
+            if c == '"':
+                state = IN_STRING
+                out.append(" ")
+                i += 1
+                continue
+            if c == "'":
+                state = IN_CHAR
+                out.append(" ")
+                i += 1
+                continue
+
+            out.append(c)
+            i += 1
+            continue
+
+        if state == IN_LINE_COMMENT:
+            # Keep newline, blank everything else
+            if c == "\n":
+                state = IN_NONE
+                out.append("\n")
+            else:
+                out.append(" ")
+            i += 1
+            continue
+
+        if state == IN_BLOCK_COMMENT:
+            if c == "*" and i + 1 < n and text[i + 1] == "/":
+                out.append(" ")
+                out.append(" ")
+                i += 2
+                state = IN_NONE
+            else:
+                out.append("\n" if c == "\n" else " ")
+                i += 1
+            continue
+
+        if state == IN_STRING:
+            # Handle escapes
+            if c == "\\" and i + 1 < n:
+                out.append(" ")
+                out.append(" ")
+                i += 2
+                continue
+            if c == '"':
+                out.append(" ")
+                i += 1
+                state = IN_NONE
+            else:
+                out.append("\n" if c == "\n" else " ")
+                i += 1
+            continue
+
+        if state == IN_CHAR:
+            if c == "\\" and i + 1 < n:
+                out.append(" ")
+                out.append(" ")
+                i += 2
+                continue
+            if c == "'":
+                out.append(" ")
+                i += 1
+                state = IN_NONE
+            else:
+                out.append("\n" if c == "\n" else " ")
+                i += 1
+            continue
+
+    return "".join(out)
+
+
+# -----------------------------------------------------
+# Phase B: robust function index (multiline signatures)
+# -----------------------------------------------------
+
+_IDENT_START = re.compile(r"[A-Za-z_]")
+_IDENT_BODY  = re.compile(r"[A-Za-z_0-9]")
+
+def _build_line_starts(text: str) -> List[int]:
+    starts = [0]
+    for i, ch in enumerate(text):
+        if ch == "\n":
+            starts.append(i + 1)
+    return starts
+
+def _idx_to_line(line_starts: List[int], idx: int) -> int:
+    # binary search
+    lo, hi = 0, len(line_starts) - 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if line_starts[mid] <= idx:
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return hi  # 0-based line index
+
+
+def _skip_ws(text: str, i: int) -> int:
+    n = len(text)
+    while i < n and text[i].isspace():
+        i += 1
+    return i
+
+
+def _parse_ident(text: str, i: int) -> Tuple[Optional[str], int]:
+    n = len(text)
+    if i >= n or not _IDENT_START.match(text[i]):
+        return None, i
+    j = i + 1
+    while j < n and _IDENT_BODY.match(text[j]):
+        j += 1
+    return text[i:j], j
+
+
+def _skip_balanced_parens(text: str, i: int) -> int:
+    """
+    If text[i] == '(', skip until matching ')', supporting nested parentheses.
+    Assumes comments/strings already sanitized.
+    """
+    n = len(text)
+    if i >= n or text[i] != "(":
+        return i
+    depth = 0
+    while i < n:
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return i
+
+
+def _skip_preprocessor_line(text: str, i: int) -> int:
+    """
+    Skip from '#' to end of (possibly continued) directive line.
+    A continuation is recognized by a trailing backslash before newline.
+    """
+    n = len(text)
+    # skip until newline, handling "\" continuation
+    while i < n:
+        # find end of line
+        nl = text.find("\n", i)
+        if nl == -1:
+            return n
+        # check if line ends with backslash (ignoring trailing spaces)
+        k = nl - 1
+        while k >= i and text[k] in " \t\r":
+            k -= 1
+        if k >= i and text[k] == "\\":
+            i = nl + 1
+            continue
+        return nl + 1
+    return n
+
+
+def _build_function_index(sanitized_text: str) -> Dict[str, Tuple[int, int]]:
+    """
+    Build a mapping func_name -> (start_line, end_line) for function *definitions*.
+    Works for multiline signatures and '{' on a separate line.
+
+    Strategy (top-level only):
+      - At brace_depth == 0, look for IDENT followed by '(' (parameter list).
+      - Take IDENT immediately before that '(' as candidate name.
+      - After matching ')', skip whitespace and common attribute-like constructs,
+        then accept '{' as definition opener (reject if ';' before '{').
+      - Then scan matching braces to find end line.
+
+    Notes:
+      - Comments/strings must be sanitized first.
+      - Preprocessor lines are skipped because they can contain braces/parentheses.
+    """
+    text = sanitized_text
+    line_starts = _build_line_starts(text)
+    n = len(text)
+    i = 0
+    brace_depth = 0
+
+    functions: Dict[str, Tuple[int, int]] = {}
+
+    while i < n:
+        c = text[i]
+
+        # skip preprocessor lines
+        if c == "#":
+            i = _skip_preprocessor_line(text, i)
+            continue
+
+        # update brace depth
+        if c == "{":
+            brace_depth += 1
+            i += 1
+            continue
+        if c == "}":
+            brace_depth = max(0, brace_depth - 1)
+            i += 1
+            continue
+
+        # Only attempt to detect function definitions at top level
+        if brace_depth != 0:
+            i += 1
+            continue
+
+        # Try parse an identifier
+        ident, j = _parse_ident(text, i)
+        if not ident:
+            i += 1
+            continue
+
+        # Look ahead for '(' after optional whitespace
+        k = _skip_ws(text, j)
+        if k >= n or text[k] != "(":
+            i = j
+            continue
+
+        # Candidate function name is 'ident'
+        func_name = ident
+
+        # Parse parameter list
+        after_params = _skip_balanced_parens(text, k)
+        after_params = _skip_ws(text, after_params)
+
+        # After ')', there can be:
+        #   - attributes: __attribute__((...))
+        #   - macros with parentheses: CURL_ATTR_NONNULL(...)
+        #   - qualifiers: const, noexcept (C++), etc.
+        # We'll conservatively skip sequences of IDENT and balanced parens groups.
+        t = after_params
+        saw_semicolon = False
+        saw_lbrace = False
+
+        while t < n:
+            t = _skip_ws(text, t)
+            if t >= n:
+                break
+
+            if text[t] == ";":
+                saw_semicolon = True
+                t += 1
+                break
+
+            if text[t] == "{":
+                saw_lbrace = True
+                break
+
+            # Skip attribute/macro tokens: IDENT [ ( ... ) ] possibly repeated
+            tok, t2 = _parse_ident(text, t)
+            if tok:
+                t = _skip_ws(text, t2)
+                # if followed by '(' -> skip balanced group (attributes/macros)
+                if t < n and text[t] == "(":
+                    t = _skip_balanced_parens(text, t)
+                continue
+
+            # If we see '(' directly (rare), skip it
+            if text[t] == "(":
+                t = _skip_balanced_parens(text, t)
+                continue
+
+            # Other tokens (e.g., '*', ',', etc.) - advance
+            t += 1
+
+        # We only accept if we found '{' before ';'
+        if (not saw_lbrace) or saw_semicolon:
+            i = j
+            continue
+
+        # We found a function definition for func_name starting at i (line)
+        start_line = _idx_to_line(line_starts, i)
+
+        # Now find the end by matching braces starting from the '{'
+        body_i = t
+        depth = 0
+        p = body_i
+        while p < n:
+            if text[p] == "#":
+                p = _skip_preprocessor_line(text, p)
+                continue
+            if text[p] == "{":
+                depth += 1
+            elif text[p] == "}":
+                depth -= 1
+                if depth == 0:
+                    end_line = _idx_to_line(line_starts, p)
+                    functions[func_name] = (start_line, end_line)
+                    p += 1
+                    break
+            p += 1
+
+        i = p
+        continue
+
+    return functions
+
+
+# ---------------------------------------------------
+# Phase C: CPP-exact presence condition line mapping
+# ---------------------------------------------------
+
+@dataclass
+class _CondFrame:
+    branches_seen: List[str]  # base expressions E1, E2, ... (normalized)
+    current_expr: str         # active expression for the current branch (already exclusive)
 
 class PresenceConditionExtractor:
     """
-    Presence-condition (PC) extraction for C code guarded by preprocessor directives.
+    Presence Condition (PC) extractor for function calls in C code under
+    conditional compilation directives.
 
-    This class computes the boolean presence condition under which each invocation
-    of a target callee occurs within a given caller function, honoring the semantics
-    of C preprocessor conditionals:
+    This implementation computes *CPP-exact* branch conditions:
+      - #elif E_k is active under: (!E_1 && !E_2 && ... && E_k)
+      - #else is active under: (!E_1 && !E_2 && ...)
 
-      - `#if`, `#ifdef`, `#ifndef` push a new conditional frame onto a stack.
-      - `#elif` replaces the *current* branch condition at that nesting level.
-      - `#else` becomes the conjunction of the negations of *all prior branches*
-        in the same conditional chain (i.e., `!b1 && !b2 && ...`).
-      - `#endif` pops the current frame.
-
-    Key design choices:
-      • Comment removal preserves directive lines so conditional structure is intact.
-      • Call-site discovery excludes preprocessor lines (`#...`) to avoid false matches.
-      • Multi-line `#if/#elif` conditions ending with a backslash `\` are correctly
-        concatenated before normalization.
-      • `defined(M)` and `defined M` are both normalized to `M`, and `!defined(M)` to `!M`.
-
-    The public API returns one PC per call site occurrence, preserving the order
-    of calls in the caller’s body.
-
-    Usage:
-        extractor = PresenceConditionExtractor(source_code_str)
-        pcs = extractor.extract_pc_from_caller_context("caller_name", "callee_name")
+    The returned PC for a call site is the conjunction of all active conditional
+    expressions from outer to inner directives. If none applies, PC is TRUE.
     """
 
-    # ------------ Initialization & pre-processing ------------
-
     def __init__(self, source_code: str):
-        """
-        Build an extractor over the provided C source code.
+        self.source_code = source_code
+        self.source_lines = source_code.splitlines()
+        self._sanitized = _sanitize_c_text(source_code)
+        self._san_lines = self._sanitized.splitlines()
 
-        Args:
-            source_code: Raw C translation unit as a single string. It may contain
-                         comments and preprocessor directives.
+        # Build function index once per file
+        self._func_index = _build_function_index(self._sanitized)
 
-        Notes:
-            The constructor strips both block (`/* ... */`) and line (`// ...`) comments
-            while leaving preprocessor lines untouched, then stores a split-by-line
-            representation for subsequent analysis.
-        """
-        self._raw = source_code
-        self._clean = self._strip_comments_preserving_directives(source_code)
-        self.lines = self._clean.splitlines()
-
-    def _strip_comments_preserving_directives(self, text: str) -> str:
-        """
-        Remove comments without deleting preprocessor directive lines.
-
-        We first drop `/* ... */` blocks (DOTALL to span lines), then remove `// ...`
-        end-of-line comments. Directives like `#if ...` remain intact.
-
-        Args:
-            text: Raw C source code.
-
-        Returns:
-            The source code with comments removed but directives preserved.
-        """
-        # remove /* ... */ (multi-line) first
-        no_block = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
-        # remove // ... (end-of-line)
-        no_line = re.sub(r"//.*?$", "", no_block, flags=re.MULTILINE)
-        return no_line
-
-    # ---------------- Public API ------------------
+        # Build PC map once per file (line -> PC)
+        self._pc_at_line = self._build_pc_map_cpp_exact()
 
     def extract_pc_from_caller_context(self, caller_name: str, callee_name: str) -> List[str]:
         """
-        Compute the presence condition(s) under which the given callee is invoked
-        within the specified caller.
+        Return all PCs under which callee is called inside caller.
+        One PC per call occurrence (order preserved). If multiple calls on a line,
+        the same PC repeats.
 
-        Args:
-            caller_name: Name of the function that contains the call(s).
-            callee_name: Name of the function being called.
-
-        Returns:
-            A list of presence-condition strings, one per call site occurrence,
-            in lexical order. If the caller cannot be found, returns
-            `["CALLER_NOT_FOUND"]`. If the caller exists but no call to the
-            callee appears within its body, returns `["CALL_NOT_FOUND"]`.
-
-        Notes:
-            We build a line→PC map once per caller and then read off the PC for
-            each call line to ensure consistent `#elif/#else` handling.
+        Special returns:
+          - ["CALLER_NOT_FOUND"] if caller definition not found
+          - ["CALL_NOT_FOUND"] if no call site for callee in caller bounds
         """
-        start, end = self._find_function_bounds(caller_name)
-        if start is None or end is None:
+        bounds = self._func_index.get(caller_name)
+        if not bounds:
             return ["CALLER_NOT_FOUND"]
 
+        start, end = bounds
         call_lines = self._find_calls_within_bounds(callee_name, start, end)
+
         if not call_lines:
             return ["CALL_NOT_FOUND"]
 
-        pcs: List[str] = []
-        pc_by_line = self._compute_pc_map(start, end)
-        for ln in call_lines:
-            pcs.append(pc_by_line.get(ln, "TRUE"))
-        return pcs
+        return [self._pc_at_line[ln] for ln in call_lines]
 
-    # --------------- Function-boundary discovery ----------------
+    # -----------------------
+    # PC map (CPP-exact)
+    # -----------------------
 
-    def _find_function_bounds(self, func_name: str) -> Tuple[Optional[int], Optional[int]]:
+    def _build_pc_map_cpp_exact(self) -> List[str]:
         """
-        Locate the *definition* (not prototype) of `func_name` and return the
-        curly-brace span as (start_index_of_open_brace, end_index_of_matching_close).
+        Compute PC for each physical line i:
+          pc[i] = conjunction of active conditional expressions at that line,
+                  or TRUE if no active directives.
 
-        Strategy:
-            1) Find a line matching `\\b<name>\\s*\\(` to identify candidate signatures.
-            2) From that line forward, ensure we encounter a '{' *before* any ';'
-               to distinguish a definition from a prototype.
-            3) Perform brace counting from that '{' to find the matching closing brace.
-
-        Args:
-            func_name: Function identifier to locate.
-
-        Returns:
-            (start_line_index, end_line_index) if found; otherwise (None, None).
+        Directive parsing supports multiline directives with trailing backslashes.
         """
-        name = re.escape(func_name)
-        sig = re.compile(r"\b" + name + r"\s*\(")
-        n = len(self.lines)
+        pc_at_line: List[str] = ["TRUE"] * len(self.source_lines)
+
+        active_stack: List[str] = []     # stack of active expressions (already exclusive)
+        frame_stack: List[_CondFrame] = []  # frames for each #if nesting
+
         i = 0
+        n = len(self.source_lines)
+
+        def current_pc() -> str:
+            return _and_all(active_stack)
+
         while i < n:
-            if not sig.search(self.lines[i]):
+            raw = self.source_lines[i]
+            line = raw.lstrip()
+
+            # Assign PC for non-preprocessor lines (preprocessor lines are irrelevant for callsites)
+            if not line.startswith("#"):
+                pc_at_line[i] = current_pc()
                 i += 1
                 continue
 
-            # Search forward for '{' before any ';' to confirm a definition
+            # Parse (possibly continued) directive text
+            directive_text = line
             j = i
-            open_brace = None
-            saw_semicolon = False
-            while j < n:
-                cur = self.lines[j]
-                if "{" in cur:
-                    open_brace = j
-                    break
-                if ";" in cur:
-                    saw_semicolon = True
-                    break
+            while directive_text.rstrip().endswith("\\") and (j + 1) < n:
+                directive_text = directive_text.rstrip()[:-1] + " " + self.source_lines[j + 1].lstrip()
                 j += 1
 
-            # If it was a prototype or no '{' found, skip and continue scanning
-            if saw_semicolon or open_brace is None:
-                i = max(i + 1, j + 1)
-                continue
+            # Now interpret directive_text
+            m_if = re.match(r"^\#\s*if\s+(.+)$", directive_text)
+            m_ifdef = re.match(r"^\#\s*ifdef\s+([A-Za-z_]\w*)\s*$", directive_text)
+            m_ifndef = re.match(r"^\#\s*ifndef\s+([A-Za-z_]\w*)\s*$", directive_text)
+            m_elif = re.match(r"^\#\s*elif\s+(.+)$", directive_text)
+            m_else = re.match(r"^\#\s*else\b", directive_text)
+            m_endif = re.match(r"^\#\s*endif\b", directive_text)
 
-            # Balanced-brace scan to find the function body end
-            depth = 0
-            k = open_brace
-            while k < n:
-                depth += self.lines[k].count("{")
-                depth -= self.lines[k].count("}")
-                if depth == 0:
-                    return open_brace, k
-                k += 1
+            if m_if:
+                base = _normalize_defined(m_if.group(1))
+                # first branch: condition is base itself
+                active_stack.append(base)
+                frame_stack.append(_CondFrame(branches_seen=[base], current_expr=base))
 
-            i = max(i + 1, j + 1)
+            elif m_ifdef:
+                base = m_ifdef.group(1)
+                active_stack.append(base)
+                frame_stack.append(_CondFrame(branches_seen=[base], current_expr=base))
 
-        return None, None
+            elif m_ifndef:
+                base = f"!{m_ifndef.group(1)}"
+                base = _normalize_defined(base)
+                active_stack.append(base)
+                frame_stack.append(_CondFrame(branches_seen=[base], current_expr=base))
 
-    # --------------- Call-site discovery -----------------
+            elif m_elif:
+                if not frame_stack or not active_stack:
+                    # Malformed file; ignore gracefully
+                    pass
+                else:
+                    base = _normalize_defined(m_elif.group(1))
+                    # Exclusive condition: (!E1 && !E2 && ...) && base
+                    prev_bases = frame_stack[-1].branches_seen
+                    excl_prefix = _and_all([_neg(e) for e in prev_bases])
+                    excl = base if excl_prefix == "TRUE" else f"{excl_prefix} && {base}"
+
+                    # Replace top active expression (current branch) with new excl expression
+                    active_stack.pop()
+                    active_stack.append(excl)
+
+                    # Update frame
+                    frame_stack[-1].branches_seen.append(base)
+                    frame_stack[-1].current_expr = excl
+
+            elif m_else:
+                if not frame_stack or not active_stack:
+                    pass
+                else:
+                    prev_bases = frame_stack[-1].branches_seen
+                    else_expr = _and_all([_neg(e) for e in prev_bases])
+
+                    active_stack.pop()
+                    active_stack.append(else_expr)
+
+                    frame_stack[-1].current_expr = else_expr
+
+            elif m_endif:
+                if active_stack:
+                    active_stack.pop()
+                if frame_stack:
+                    frame_stack.pop()
+
+            # Advance i by the number of physical lines consumed by a continued directive
+            i = j + 1
+
+        # Ensure any remaining unset lines are correct (they already are TRUE or set above)
+        return pc_at_line
+
+    # -----------------------
+    # Call site finder
+    # -----------------------
 
     def _find_calls_within_bounds(self, callee: str, start: int, end: int) -> List[int]:
         """
-        Collect line indices for occurrences of `callee(` within [start, end],
-        ignoring any line that is itself a preprocessor directive (i.e., begins
-        with `#` possibly after whitespace).
+        Find all call occurrences of `callee` in [start, end], returning the line
+        index for each occurrence (multiplicity preserved).
 
-        Args:
-            callee: Function name being invoked.
-            start:  Index of the opening brace of the caller.
-            end:    Index of the matching closing brace of the caller.
-
-        Returns:
-            List of source line indices where `callee(` appears.
+        This detects "call-like" patterns:  <callee> ( ... )
+        It intentionally includes macro-like calls (e.g., DEBUGASSERT(...)).
+        It ignores preprocessor lines.
         """
-        pat = re.compile(r"\b{}\s*\(".format(re.escape(callee)))
-        out: List[int] = []
-        for i in range(start, end + 1):
-            line = self.lines[i]
-            if re.match(r"^\s*#", line):  # skip preprocessor directive lines
-                continue
-            if pat.search(line):
-                out.append(i)
-        return out
+        # Quick regex for identifier + '('
+        pattern = re.compile(rf"\b{re.escape(callee)}\s*\(")
 
-    # ------------ Preprocessor state machine --------
+        # Exclude obvious non-call keywords that also use '('
+        keywords = {
+            "if", "for", "while", "switch", "return", "sizeof", "typeof", "alignof"
+        }
+        if callee in keywords:
+            # If a CSV lists a keyword as callee, treat as not found
+            return []
 
-    class _PPFrame:
-        """
-        A stack frame representing one active conditional chain at a given
-        nesting level.
-
-        Attributes:
-            current: The condition currently active for this level (after the
-                     last `#if/#elif/#else` seen at this depth).
-            alts:    The list of mutually exclusive branch conditions that have
-                     appeared in this chain so far (used to build the `#else`
-                     as `!b1 && !b2 && ...`).
-        """
-        __slots__ = ("current", "alts")
-        def __init__(self, current: str):
-            self.current = current
-            self.alts = [current]
-
-    def _normalize_expr(self, expr: str) -> str:
-        """
-        Normalize a preprocessor boolean expression into a simplified textual form:
-
-          - `defined(M)`  → `M`
-          - `defined M`   → `M`         (GNU extension)
-          - `!defined(M)` → `!M`
-
-        Args:
-            expr: Raw expression text after `#if` or `#elif` (possibly multi-line,
-                  after concatenation if line-continued).
-
-        Returns:
-            A stripped string with the above normalizations applied.
-        """
-        # defined(M)  -> M
-        expr = re.sub(r"\bdefined\s*\(\s*(\w+)\s*\)", r"\1", expr)
-        # !defined(M) -> !M
-        expr = re.sub(r"!\s*defined\s*\(\s*(\w+)\s*\)", r"!\1", expr)
-        # GNU: defined M -> M
-        expr = re.sub(r"\bdefined\s+(\w+)\b", r"\1", expr)
-        return expr.strip()
-
-    def _collect_if_or_elif_expr(self, i: int) -> Tuple[str, int]:
-        """
-        Collect the expression following `#if` or `#elif`, handling line
-        continuations that end with backslash (`\`). The accumulated text is
-        then normalized.
-
-        Args:
-            i: Index of the line that starts with `#if` or `#elif`.
-
-        Returns:
-            (normalized_expression, new_index) where `new_index` is the index of
-            the last physical line consumed in the continuation group.
-        """
-        line = self.lines[i]
-        m_if   = re.match(r"^\s*#\s*if\s+(.*)$", line)
-        m_elif = re.match(r"^\s*#\s*elif\s+(.*)$", line)
-        raw = ""
-        if m_if:
-            raw = m_if.group(1)
-        elif m_elif:
-            raw = m_elif.group(1)
-        else:
-            return "", i
-
-        acc = [raw.rstrip("\\").rstrip()]
-        j = i
-        # Continue while the current line ends with a backslash (line continuation)
-        while j < len(self.lines) and self.lines[j].rstrip().endswith("\\"):
-            j += 1
-            if j >= len(self.lines):
-                break
-            acc.append(self.lines[j].strip().rstrip("\\").rstrip())
-
-        expr = " ".join(acc)
-        expr = self._normalize_expr(expr)
-        return expr, j
-
-    def _compute_pc_map(self, start: int, end: int) -> dict:
-        """
-        Single pass over [start..end] that builds a map: source line → active PC.
-
-        We maintain a stack of `_PPFrame` objects representing the nested
-        conditional context. For a non-directive line, the current PC is the
-        conjunction of `frame.current` across the stack. For directives:
-
-          - `#if/#ifdef/#ifndef`: push a frame for the new branch.
-          - `#elif`:             update the *current* frame’s `current` and append
-                                 the alternative to `alts`.
-          - `#else`:             compute `!b1 && !b2 && ...` from `alts` so far.
-          - `#endif`:            pop one frame.
-
-        Args:
-            start: Caller’s opening brace line index.
-            end:   Caller’s matching closing brace line index.
-
-        Returns:
-            A dict mapping each non-directive source line index in the caller’s
-            body to the boolean presence condition active at that point.
-        """
-        pc_by_line: dict = {}
-        stack: List[PresenceConditionExtractor._PPFrame] = []
-
-        i = start
-        while i <= end:
-            line = self.lines[i]
-
-            # #if ...
-            if re.match(r"^\s*#\s*if\b", line):
-                expr, i = self._collect_if_or_elif_expr(i)
-                if expr == "":
-                    expr = "TRUE"
-                stack.append(self._PPFrame(expr))
-                i += 1
+        hits: List[int] = []
+        for ln in range(start, end + 1):
+            raw = self.source_lines[ln].lstrip()
+            if raw.startswith("#"):
                 continue
 
-            # #ifdef NAME
-            m_ifdef = re.match(r"^\s*#\s*ifdef\s+(\w+)", line)
-            if m_ifdef:
-                stack.append(self._PPFrame(m_ifdef.group(1)))
-                i += 1
-                continue
+            # Use sanitized line to avoid matching inside comments/strings
+            sline = self._san_lines[ln] if ln < len(self._san_lines) else self.source_lines[ln]
 
-            # #ifndef NAME
-            m_ifndef = re.match(r"^\s*#\s*ifndef\s+(\w+)", line)
-            if m_ifndef:
-                stack.append(self._PPFrame(f"!{m_ifndef.group(1)}"))
-                i += 1
-                continue
+            for _ in pattern.finditer(sline):
+                hits.append(ln)
 
-            # #elif ...
-            if re.match(r"^\s*#\s*elif\b", line):
-                expr, i = self._collect_if_or_elif_expr(i)
-                if stack:
-                    frame = stack[-1]
-                    frame.current = expr if expr else "TRUE"
-                    frame.alts.append(frame.current)
-                i += 1
-                continue
-
-            # #else
-            if re.match(r"^\s*#\s*else\b", line):
-                if stack:
-                    frame = stack[-1]
-                    # else is the conjunction of the negations of all previous branches
-                    if frame.alts:
-                        neg = [f"!({b})" for b in frame.alts]
-                        frame.current = " && ".join(neg)
-                    else:
-                        frame.current = "TRUE"
-                i += 1
-                continue
-
-            # #endif
-            if re.match(r"^\s*#\s*endif\b", line):
-                if stack:
-                    stack.pop()
-                i += 1
-                continue
-
-            # Non-directive line: compute the current PC as the conjunction
-            cur_pc = " && ".join(fr.current for fr in stack) if stack else "TRUE"
-            pc_by_line[i] = cur_pc if cur_pc else "TRUE"
-            i += 1
-
-        return pc_by_line
+        return hits
