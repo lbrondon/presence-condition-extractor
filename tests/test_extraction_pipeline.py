@@ -113,6 +113,26 @@ class ExtractionPipelineTests(unittest.TestCase):
             out = self._run_single(projects_dir, "proj", "unit.c", "caller", "callee")
             self.assertEqual(out.iloc[0]["PC"], "OUTER && INNER")
 
+    def test_deduplicates_multiple_calls_on_same_line_with_same_pc(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            projects_dir = Path(tmp)
+            proj_dir = projects_dir / "proj"
+            proj_dir.mkdir(parents=True, exist_ok=True)
+            (proj_dir / "unit.c").write_text(
+                "void callee(void) {}\n"
+                "int caller(void) {\n"
+                "  callee(); callee();\n"
+                "  return 0;\n"
+                "}\n",
+                encoding="utf-8",
+            )
+
+            out = self._run_single(projects_dir, "proj", "unit.c", "caller", "callee")
+            # The extractor sees both call sites, but the pipeline's final dedup step
+            # collapses identical (Project, File, Caller, Callee, PC) rows.
+            self.assertEqual(len(out), 1)
+            self.assertEqual(out.iloc[0]["PC"], "TRUE")
+
 
 if __name__ == "__main__":
     unittest.main()
