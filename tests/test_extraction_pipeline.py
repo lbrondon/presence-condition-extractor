@@ -68,6 +68,51 @@ class ExtractionPipelineTests(unittest.TestCase):
             out = self._run_single(projects_dir, "proj", "unit.c", "caller", "callee")
             self.assertEqual(out.iloc[0]["PC"], "TRUE")
 
+    def test_expands_if_elif_else_with_cpp_exact_conditions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            projects_dir = Path(tmp)
+            proj_dir = projects_dir / "proj"
+            proj_dir.mkdir(parents=True, exist_ok=True)
+            (proj_dir / "unit.c").write_text(
+                "void callee(void) {}\n"
+                "int caller(void) {\n"
+                "#if defined(FOO)\n"
+                "  callee();\n"
+                "#elif defined(BAR)\n"
+                "  callee();\n"
+                "#else\n"
+                "  callee();\n"
+                "#endif\n"
+                "  return 0;\n"
+                "}\n",
+                encoding="utf-8",
+            )
+
+            out = self._run_single(projects_dir, "proj", "unit.c", "caller", "callee")
+            pcs = sorted(out["PC"].tolist())
+            self.assertEqual(sorted(["FOO", "!(FOO) && BAR", "!(FOO) && !(BAR)"]), pcs)
+
+    def test_conjoins_nested_preprocessor_conditions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            projects_dir = Path(tmp)
+            proj_dir = projects_dir / "proj"
+            proj_dir.mkdir(parents=True, exist_ok=True)
+            (proj_dir / "unit.c").write_text(
+                "void callee(void) {}\n"
+                "int caller(void) {\n"
+                "#if OUTER\n"
+                "#if defined(INNER)\n"
+                "  callee();\n"
+                "#endif\n"
+                "#endif\n"
+                "  return 0;\n"
+                "}\n",
+                encoding="utf-8",
+            )
+
+            out = self._run_single(projects_dir, "proj", "unit.c", "caller", "callee")
+            self.assertEqual(out.iloc[0]["PC"], "OUTER && INNER")
+
 
 if __name__ == "__main__":
     unittest.main()
