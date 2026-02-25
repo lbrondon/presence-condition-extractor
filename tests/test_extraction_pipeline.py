@@ -133,6 +133,62 @@ class ExtractionPipelineTests(unittest.TestCase):
             self.assertEqual(len(out), 1)
             self.assertEqual(out.iloc[0]["PC"], "TRUE")
 
+    def test_pipeline_output_matches_expected_records_for_mixed_cases(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            projects_dir = Path(tmp)
+            proj_dir = projects_dir / "proj"
+            proj_dir.mkdir(parents=True, exist_ok=True)
+            (proj_dir / "unit.c").write_text(
+                "void callee(void) {}\n"
+                "int caller(void) {\n"
+                "#if defined(FOO)\n"
+                "  callee();\n"
+                "#else\n"
+                "  callee();\n"
+                "#endif\n"
+                "  return 0;\n"
+                "}\n",
+                encoding="utf-8",
+            )
+
+            df = pd.DataFrame(
+                [
+                    {"Project": "proj", "File": "unit.c", "Caller": "caller", "Callee": "callee"},
+                    {"Project": "proj", "File": "unit.c", "Caller": "missing", "Callee": "callee"},
+                    {"Project": "proj", "File": "missing.c", "Caller": "caller", "Callee": "callee"},
+                    {"Project": "proj", "File": "unit.c", "Caller": "caller", "Callee": "defined"},
+                ]
+            )
+
+            out = run_extraction_pipeline(df, str(projects_dir))
+            records = out[["Project", "File", "Caller", "Callee", "PC"]].to_dict(orient="records")
+
+            expected = [
+                {"Project": "proj", "File": "unit.c", "Caller": "caller", "Callee": "callee", "PC": "FOO"},
+                {
+                    "Project": "proj",
+                    "File": "unit.c",
+                    "Caller": "missing",
+                    "Callee": "callee",
+                    "PC": "CALLER_NOT_FOUND",
+                },
+                {
+                    "Project": "proj",
+                    "File": "missing.c",
+                    "Caller": "caller",
+                    "Callee": "callee",
+                    "PC": "FILE_NOT_FOUND",
+                },
+                {
+                    "Project": "proj",
+                    "File": "unit.c",
+                    "Caller": "caller",
+                    "Callee": "callee",
+                    "PC": "!(FOO)",
+                },
+            ]
+            self.assertEqual(records, expected)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
-from typing import Dict, List, Tuple
+from typing import Dict, Iterator, List, Tuple
 
 import pandas as pd
 
@@ -10,6 +10,12 @@ from PresenceConditionExtractor import PresenceConditionExtractor
 from SourceCodeAnalyzer import SourceCodeAnalyzer
 from extraction_status import CALL_NOT_FOUND, FILE_NOT_FOUND, UNDEFINED
 from path_resolver import is_regular_file, resolve_source_path
+
+SourceCache = Dict[str, str]
+ExtractorCache = Dict[str, PresenceConditionExtractor]
+PcCacheKey = Tuple[str, str, str]
+PcCache = Dict[PcCacheKey, List[str]]
+ExtraRows = List[pd.Series]
 
 
 @dataclass(frozen=True)
@@ -62,9 +68,9 @@ def _get_cached_pcs(
     abs_path: str,
     caller: str,
     callee: str,
-    source_cache: Dict[str, str],
-    extractor_cache: Dict[str, PresenceConditionExtractor],
-    pc_cache: Dict[Tuple[str, str, str], List[str]],
+    source_cache: SourceCache,
+    extractor_cache: ExtractorCache,
+    pc_cache: PcCache,
 ) -> List[str]:
     cache_key = (abs_path, caller, callee)
     if cache_key not in pc_cache:
@@ -80,7 +86,7 @@ def _get_cached_pcs(
     return pc_cache[cache_key]
 
 
-def _finalize_output_df(df: pd.DataFrame, extra_rows: List[pd.Series]) -> pd.DataFrame:
+def _finalize_output_df(df: pd.DataFrame, extra_rows: ExtraRows) -> pd.DataFrame:
     # Append extra rows (multi-call expansion)
     if extra_rows:
         df = pd.concat([df, pd.DataFrame(extra_rows)], ignore_index=True)
@@ -91,7 +97,7 @@ def _finalize_output_df(df: pd.DataFrame, extra_rows: List[pd.Series]) -> pd.Dat
     return df
 
 
-def _iter_requests(df: pd.DataFrame):
+def _iter_requests(df: pd.DataFrame) -> Iterator[_ExtractionRequest]:
     for idx, project_raw, file_raw, caller_raw, callee_raw in df[
         ["Project", "File", "Caller", "Callee"]
     ].itertuples(index=True, name=None):
@@ -108,10 +114,10 @@ def _process_request(
     req: _ExtractionRequest,
     df: pd.DataFrame,
     projects_dir: str,
-    source_cache: Dict[str, str],
-    extractor_cache: Dict[str, PresenceConditionExtractor],
-    pc_cache: Dict[Tuple[str, str, str], List[str]],
-    extra_rows: List[pd.Series],
+    source_cache: SourceCache,
+    extractor_cache: ExtractorCache,
+    pc_cache: PcCache,
+    extra_rows: ExtraRows,
 ) -> None:
     abs_path = resolve_source_path(projects_dir, req.project, req.file_field)
     logging.info(
@@ -160,16 +166,16 @@ def run_extraction_pipeline(df: pd.DataFrame, projects_dir: str) -> pd.DataFrame
     df = _prepare_input_df(df)
 
     # Cache loaded source code per absolute file path (big speedup in large datasets)
-    source_cache: Dict[str, str] = {}
+    source_cache: SourceCache = {}
 
     # Cache parsed extractors per absolute file path (avoids rebuilding indices/PC maps)
-    extractor_cache: Dict[str, PresenceConditionExtractor] = {}
+    extractor_cache: ExtractorCache = {}
 
     # Cache extraction results per (abs_path, caller, callee)
-    pc_cache: Dict[Tuple[str, str, str], List[str]] = {}
+    pc_cache: PcCache = {}
 
     # Collect extra rows when a caller contains multiple call sites for the same callee
-    extra_rows: List[pd.Series] = []
+    extra_rows: ExtraRows = []
 
     for req in _iter_requests(df):
         _process_request(req, df, projects_dir, source_cache, extractor_cache, pc_cache, extra_rows)
