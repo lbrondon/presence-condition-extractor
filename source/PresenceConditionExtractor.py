@@ -413,9 +413,14 @@ class PresenceConditionExtractor:
     def __init__(self, source_code: str):
         self.source_code = source_code
         self.source_lines = source_code.splitlines()
-        self._sanitized = _sanitize_c_text(source_code)
+        self._initialize_internal_views()
+        self._initialize_indexes()
+
+    def _initialize_internal_views(self) -> None:
+        self._sanitized = _sanitize_c_text(self.source_code)
         self._san_lines = self._sanitized.splitlines()
 
+    def _initialize_indexes(self) -> None:
         # Build function index once per file
         self._func_index = _build_function_index(self._sanitized)
 
@@ -477,80 +482,94 @@ class PresenceConditionExtractor:
                 i += 1
                 continue
 
-            # Parse (possibly continued) directive text
-            directive_text = line
-            j = i
-            while directive_text.rstrip().endswith("\\") and (j + 1) < n:
-                directive_text = directive_text.rstrip()[:-1] + " " + self.source_lines[j + 1].lstrip()
-                j += 1
-
-            # Now interpret directive_text
-            m_if = re.match(r"^\#\s*if\s+(.+)$", directive_text)
-            m_ifdef = re.match(r"^\#\s*ifdef\s+([A-Za-z_]\w*)\s*$", directive_text)
-            m_ifndef = re.match(r"^\#\s*ifndef\s+([A-Za-z_]\w*)\s*$", directive_text)
-            m_elif = re.match(r"^\#\s*elif\s+(.+)$", directive_text)
-            m_else = re.match(r"^\#\s*else\b", directive_text)
-            m_endif = re.match(r"^\#\s*endif\b", directive_text)
-
-            if m_if:
-                base = _normalize_defined(m_if.group(1))
-                # first branch: condition is base itself
-                active_stack.append(base)
-                frame_stack.append(_CondFrame(branches_seen=[base], current_expr=base))
-
-            elif m_ifdef:
-                base = m_ifdef.group(1)
-                active_stack.append(base)
-                frame_stack.append(_CondFrame(branches_seen=[base], current_expr=base))
-
-            elif m_ifndef:
-                base = f"!{m_ifndef.group(1)}"
-                base = _normalize_defined(base)
-                active_stack.append(base)
-                frame_stack.append(_CondFrame(branches_seen=[base], current_expr=base))
-
-            elif m_elif:
-                if not frame_stack or not active_stack:
-                    # Malformed file; ignore gracefully
-                    pass
-                else:
-                    base = _normalize_defined(m_elif.group(1))
-                    # Exclusive condition: (!E1 && !E2 && ...) && base
-                    prev_bases = frame_stack[-1].branches_seen
-                    excl_prefix = _and_all([_neg(e) for e in prev_bases])
-                    excl = base if excl_prefix == TRUE else f"{excl_prefix} && {base}"
-
-                    # Replace top active expression (current branch) with new excl expression
-                    active_stack.pop()
-                    active_stack.append(excl)
-
-                    # Update frame
-                    frame_stack[-1].branches_seen.append(base)
-                    frame_stack[-1].current_expr = excl
-
-            elif m_else:
-                if not frame_stack or not active_stack:
-                    pass
-                else:
-                    prev_bases = frame_stack[-1].branches_seen
-                    else_expr = _and_all([_neg(e) for e in prev_bases])
-
-                    active_stack.pop()
-                    active_stack.append(else_expr)
-
-                    frame_stack[-1].current_expr = else_expr
-
-            elif m_endif:
-                if active_stack:
-                    active_stack.pop()
-                if frame_stack:
-                    frame_stack.pop()
+            directive_text, j = self._read_continued_directive(i)
+            self._apply_directive_to_pc_stacks(directive_text, active_stack, frame_stack)
 
             # Advance i by the number of physical lines consumed by a continued directive
             i = j + 1
 
         # Ensure any remaining unset lines are correct (they already are TRUE or set above)
         return pc_at_line
+
+    def _read_continued_directive(self, start_line_idx: int) -> Tuple[str, int]:
+        """Return normalized directive text plus the last consumed physical line index."""
+        directive_text = self.source_lines[start_line_idx].lstrip()
+        j = start_line_idx
+        while directive_text.rstrip().endswith("\\") and (j + 1) < len(self.source_lines):
+            directive_text = directive_text.rstrip()[:-1] + " " + self.source_lines[j + 1].lstrip()
+            j += 1
+        return directive_text, j
+
+    def _apply_directive_to_pc_stacks(
+        self,
+        directive_text: str,
+        active_stack: List[str],
+        frame_stack: List[_CondFrame],
+    ) -> None:
+        m_if = re.match(r"^\#\s*if\s+(.+)$", directive_text)
+        m_ifdef = re.match(r"^\#\s*ifdef\s+([A-Za-z_]\w*)\s*$", directive_text)
+        m_ifndef = re.match(r"^\#\s*ifndef\s+([A-Za-z_]\w*)\s*$", directive_text)
+        m_elif = re.match(r"^\#\s*elif\s+(.+)$", directive_text)
+        m_else = re.match(r"^\#\s*else\b", directive_text)
+        m_endif = re.match(r"^\#\s*endif\b", directive_text)
+
+        if m_if:
+            base = _normalize_defined(m_if.group(1))
+            # first branch: condition is base itself
+            active_stack.append(base)
+            frame_stack.append(_CondFrame(branches_seen=[base], current_expr=base))
+            return
+
+        if m_ifdef:
+            base = m_ifdef.group(1)
+            active_stack.append(base)
+            frame_stack.append(_CondFrame(branches_seen=[base], current_expr=base))
+            return
+
+        if m_ifndef:
+            base = _normalize_defined(f"!{m_ifndef.group(1)}")
+            active_stack.append(base)
+            frame_stack.append(_CondFrame(branches_seen=[base], current_expr=base))
+            return
+
+        if m_elif:
+            if not frame_stack or not active_stack:
+                # Malformed file; ignore gracefully
+                return
+
+            base = _normalize_defined(m_elif.group(1))
+            # Exclusive condition: (!E1 && !E2 && ...) && base
+            prev_bases = frame_stack[-1].branches_seen
+            excl_prefix = _and_all([_neg(e) for e in prev_bases])
+            excl = base if excl_prefix == TRUE else f"{excl_prefix} && {base}"
+
+            # Replace top active expression (current branch) with new excl expression
+            active_stack.pop()
+            active_stack.append(excl)
+
+            # Update frame
+            frame_stack[-1].branches_seen.append(base)
+            frame_stack[-1].current_expr = excl
+            return
+
+        if m_else:
+            if not frame_stack or not active_stack:
+                return
+
+            prev_bases = frame_stack[-1].branches_seen
+            else_expr = _and_all([_neg(e) for e in prev_bases])
+
+            active_stack.pop()
+            active_stack.append(else_expr)
+
+            frame_stack[-1].current_expr = else_expr
+            return
+
+        if m_endif:
+            if active_stack:
+                active_stack.pop()
+            if frame_stack:
+                frame_stack.pop()
 
     # -----------------------
     # Call site finder
