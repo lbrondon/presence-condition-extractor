@@ -50,6 +50,19 @@ class PresenceConditionExtractorTests(unittest.TestCase):
         extractor = PresenceConditionExtractor(src)
         self.assertEqual(extractor.extract_pc_from_caller_context("caller", "callee"), ["FOO || BAR"])
 
+    def test_normalizes_defined_without_parentheses(self):
+        src = (
+            "void callee(void) {}\n"
+            "int caller(void) {\n"
+            "#if defined FOO\n"
+            "  callee();\n"
+            "#endif\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        extractor = PresenceConditionExtractor(src)
+        self.assertEqual(extractor.extract_pc_from_caller_context("caller", "callee"), ["FOO"])
+
     def test_ignores_comment_and_string_false_positives(self):
         src = (
             "void callee(void) {}\n"
@@ -75,6 +88,23 @@ class PresenceConditionExtractorTests(unittest.TestCase):
         )
         extractor = PresenceConditionExtractor(src)
         self.assertEqual(extractor.extract_pc_from_caller_context("caller", "callee"), ["TRUE", "TRUE"])
+
+    def test_handles_nested_else_branch_condition(self):
+        src = (
+            "void callee(void) {}\n"
+            "int caller(void) {\n"
+            "#if OUTER\n"
+            "#if INNER\n"
+            "  return 1;\n"
+            "#else\n"
+            "  callee();\n"
+            "#endif\n"
+            "#endif\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        extractor = PresenceConditionExtractor(src)
+        self.assertEqual(extractor.extract_pc_from_caller_context("caller", "callee"), ["OUTER && !(INNER)"])
 
 
 if __name__ == "__main__":

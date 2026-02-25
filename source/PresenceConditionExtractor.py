@@ -506,70 +506,86 @@ class PresenceConditionExtractor:
         active_stack: List[str],
         frame_stack: List[_CondFrame],
     ) -> None:
-        m_if = re.match(r"^\#\s*if\s+(.+)$", directive_text)
-        m_ifdef = re.match(r"^\#\s*ifdef\s+([A-Za-z_]\w*)\s*$", directive_text)
-        m_ifndef = re.match(r"^\#\s*ifndef\s+([A-Za-z_]\w*)\s*$", directive_text)
-        m_elif = re.match(r"^\#\s*elif\s+(.+)$", directive_text)
-        m_else = re.match(r"^\#\s*else\b", directive_text)
-        m_endif = re.match(r"^\#\s*endif\b", directive_text)
-
-        if m_if:
-            base = _normalize_defined(m_if.group(1))
-            # first branch: condition is base itself
-            active_stack.append(base)
-            frame_stack.append(_CondFrame(branches_seen=[base], current_expr=base))
+        if m := re.match(r"^\#\s*if\s+(.+)$", directive_text):
+            self._handle_if(m.group(1), active_stack, frame_stack)
             return
 
-        if m_ifdef:
-            base = m_ifdef.group(1)
-            active_stack.append(base)
-            frame_stack.append(_CondFrame(branches_seen=[base], current_expr=base))
+        if m := re.match(r"^\#\s*ifdef\s+([A-Za-z_]\w*)\s*$", directive_text):
+            self._handle_ifdef(m.group(1), active_stack, frame_stack)
             return
 
-        if m_ifndef:
-            base = _normalize_defined(f"!{m_ifndef.group(1)}")
-            active_stack.append(base)
-            frame_stack.append(_CondFrame(branches_seen=[base], current_expr=base))
+        if m := re.match(r"^\#\s*ifndef\s+([A-Za-z_]\w*)\s*$", directive_text):
+            self._handle_ifndef(m.group(1), active_stack, frame_stack)
             return
 
-        if m_elif:
-            if not frame_stack or not active_stack:
-                # Malformed file; ignore gracefully
-                return
+        if m := re.match(r"^\#\s*elif\s+(.+)$", directive_text):
+            self._handle_elif(m.group(1), active_stack, frame_stack)
+            return
 
-            base = _normalize_defined(m_elif.group(1))
-            # Exclusive condition: (!E1 && !E2 && ...) && base
-            prev_bases = frame_stack[-1].branches_seen
-            excl_prefix = _and_all([_neg(e) for e in prev_bases])
-            excl = base if excl_prefix == TRUE else f"{excl_prefix} && {base}"
+        if re.match(r"^\#\s*else\b", directive_text):
+            self._handle_else(active_stack, frame_stack)
+            return
 
-            # Replace top active expression (current branch) with new excl expression
+        if re.match(r"^\#\s*endif\b", directive_text):
+            self._handle_endif(active_stack, frame_stack)
+            return
+
+    def _push_new_conditional_frame(
+        self,
+        base_expr: str,
+        active_stack: List[str],
+        frame_stack: List[_CondFrame],
+    ) -> None:
+        active_stack.append(base_expr)
+        frame_stack.append(_CondFrame(branches_seen=[base_expr], current_expr=base_expr))
+
+    def _handle_if(self, expr: str, active_stack: List[str], frame_stack: List[_CondFrame]) -> None:
+        base = _normalize_defined(expr)
+        self._push_new_conditional_frame(base, active_stack, frame_stack)
+
+    def _handle_ifdef(self, macro: str, active_stack: List[str], frame_stack: List[_CondFrame]) -> None:
+        self._push_new_conditional_frame(macro, active_stack, frame_stack)
+
+    def _handle_ifndef(self, macro: str, active_stack: List[str], frame_stack: List[_CondFrame]) -> None:
+        base = _normalize_defined(f"!{macro}")
+        self._push_new_conditional_frame(base, active_stack, frame_stack)
+
+    def _handle_elif(self, expr: str, active_stack: List[str], frame_stack: List[_CondFrame]) -> None:
+        if not frame_stack or not active_stack:
+            # Malformed file; ignore gracefully
+            return
+
+        base = _normalize_defined(expr)
+        # Exclusive condition: (!E1 && !E2 && ...) && base
+        prev_bases = frame_stack[-1].branches_seen
+        excl_prefix = _and_all([_neg(e) for e in prev_bases])
+        excl = base if excl_prefix == TRUE else f"{excl_prefix} && {base}"
+
+        # Replace top active expression (current branch) with new excl expression
+        active_stack.pop()
+        active_stack.append(excl)
+
+        # Update frame
+        frame_stack[-1].branches_seen.append(base)
+        frame_stack[-1].current_expr = excl
+
+    def _handle_else(self, active_stack: List[str], frame_stack: List[_CondFrame]) -> None:
+        if not frame_stack or not active_stack:
+            return
+
+        prev_bases = frame_stack[-1].branches_seen
+        else_expr = _and_all([_neg(e) for e in prev_bases])
+
+        active_stack.pop()
+        active_stack.append(else_expr)
+
+        frame_stack[-1].current_expr = else_expr
+
+    def _handle_endif(self, active_stack: List[str], frame_stack: List[_CondFrame]) -> None:
+        if active_stack:
             active_stack.pop()
-            active_stack.append(excl)
-
-            # Update frame
-            frame_stack[-1].branches_seen.append(base)
-            frame_stack[-1].current_expr = excl
-            return
-
-        if m_else:
-            if not frame_stack or not active_stack:
-                return
-
-            prev_bases = frame_stack[-1].branches_seen
-            else_expr = _and_all([_neg(e) for e in prev_bases])
-
-            active_stack.pop()
-            active_stack.append(else_expr)
-
-            frame_stack[-1].current_expr = else_expr
-            return
-
-        if m_endif:
-            if active_stack:
-                active_stack.pop()
-            if frame_stack:
-                frame_stack.pop()
+        if frame_stack:
+            frame_stack.pop()
 
     # -----------------------
     # Call site finder
