@@ -36,12 +36,27 @@ class SourceCodeAnalyzer:
         Raises:
             Exception: If the file cannot be read.
         """
-        try:
-            with open(self.source_code_path, 'r') as file:
-                return file.read()
-        except Exception as e:
-            print(f"Error loading source code: {e}")
-            raise
+        encodings_to_try = ("utf-8", "cp1252", "latin-1")
+        last_error = None
+
+        for encoding in encodings_to_try:
+            try:
+                with open(self.source_code_path, "r", encoding=encoding) as file:
+                    content = file.read()
+                    if encoding != "utf-8":
+                        print(
+                            f"Warning: loaded '{self.source_code_path}' using fallback encoding '{encoding}'."
+                        )
+                    return content
+            except UnicodeDecodeError as e:
+                last_error = e
+                continue
+            except Exception as e:
+                print(f"Error loading source code: {e}")
+                raise
+
+        print(f"Error loading source code: {last_error}")
+        raise last_error
 
     def find_function_definition(self, function_name: str) -> Optional[re.Match]:
         """
