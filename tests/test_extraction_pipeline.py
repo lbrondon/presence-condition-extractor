@@ -12,6 +12,8 @@ if str(SOURCE_DIR) not in sys.path:
     sys.path.insert(0, str(SOURCE_DIR))
 
 from extraction_pipeline import run_extraction_pipeline  # noqa: E402
+from PresenceConditionExtractor import PresenceConditionExtractor  # noqa: E402
+from pipeline_services import PipelineServices  # noqa: E402
 
 
 class ExtractionPipelineTests(unittest.TestCase):
@@ -188,6 +190,40 @@ class ExtractionPipelineTests(unittest.TestCase):
                 },
             ]
             self.assertEqual(records, expected)
+
+    def test_accepts_injected_services_and_reuses_loader_cache(self):
+        source_text = (
+            "void callee(void) {}\n"
+            "int caller(void) {\n"
+            "  callee();\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        load_calls = []
+
+        def fake_resolver(projects_dir: str, project: str, file_field: str) -> str:
+            return f"/virtual/{project}/{file_field}"
+
+        def fake_loader(path: str) -> str:
+            load_calls.append(path)
+            return source_text
+
+        services = PipelineServices(
+            resolve_existing_source_path=fake_resolver,
+            load_source_code=fake_loader,
+            build_extractor=PresenceConditionExtractor,
+        )
+
+        df = pd.DataFrame(
+            [
+                {"Project": "proj", "File": "unit.c", "Caller": "caller", "Callee": "callee"},
+                {"Project": "proj", "File": "unit.c", "Caller": "caller", "Callee": "callee"},
+            ]
+        )
+
+        out = run_extraction_pipeline(df, "/ignored", services=services)
+        self.assertEqual(out["PC"].tolist(), ["TRUE"])
+        self.assertEqual(load_calls, ["/virtual/proj/unit.c"])
 
 
 if __name__ == "__main__":

@@ -8,8 +8,7 @@ import pandas as pd
 from PresenceConditionExtractor import PresenceConditionExtractor
 from extraction_status import CALL_NOT_FOUND, FILE_NOT_FOUND, UNDEFINED
 from models import ExtractionRequest, PcCacheKey, PresenceConditions
-from source_loader import load_source_code
-from source_path_service import resolve_existing_source_path
+from pipeline_services import PipelineServices, default_pipeline_services
 
 SourceCache = Dict[str, str]
 ExtractorCache = Dict[str, PresenceConditionExtractor]
@@ -61,11 +60,12 @@ def _get_cached_pcs(
     source_cache: SourceCache,
     extractor_cache: ExtractorCache,
     pc_cache: PcCache,
+    services: PipelineServices,
 ) -> List[str]:
     cache_key = (abs_path, caller, callee)
     if cache_key not in pc_cache:
         if abs_path not in extractor_cache:
-            extractor_cache[abs_path] = PresenceConditionExtractor(source_cache[abs_path])
+            extractor_cache[abs_path] = services.build_extractor(source_cache[abs_path])
         extractor = extractor_cache[abs_path]
         pcs = extractor.extract_pc_from_caller_context(caller, callee)
         if isinstance(pcs, str):
@@ -108,8 +108,9 @@ def _process_request(
     extractor_cache: ExtractorCache,
     pc_cache: PcCache,
     extra_rows: ExtraRows,
+    services: PipelineServices,
 ) -> None:
-    abs_path = resolve_existing_source_path(projects_dir, req.project, req.file_field)
+    abs_path = services.resolve_existing_source_path(projects_dir, req.project, req.file_field)
     logging.info(
         f"Processing file: {abs_path or '[NOT FOUND]'}, Caller: {req.caller}, Callee: {req.callee}"
     )
@@ -122,13 +123,15 @@ def _process_request(
     # Load source (cached)
     if abs_path not in source_cache:
         try:
-            source_cache[abs_path] = load_source_code(abs_path)
+            source_cache[abs_path] = services.load_source_code(abs_path)
         except IsADirectoryError:
             logging.error(f"Path is a directory (skipping): {abs_path}")
             df.at[req.idx, "PC"] = FILE_NOT_FOUND
             return
 
-    pcs = _get_cached_pcs(abs_path, req.caller, req.callee, source_cache, extractor_cache, pc_cache)
+    pcs = _get_cached_pcs(
+        abs_path, req.caller, req.callee, source_cache, extractor_cache, pc_cache, services
+    )
 
     # First PC in the original row
     df.at[req.idx, "PC"] = pcs[0]
@@ -140,7 +143,11 @@ def _process_request(
         extra_rows.append(new_row)
 
 
-def run_extraction_pipeline(df: pd.DataFrame, projects_dir: str) -> pd.DataFrame:
+def run_extraction_pipeline(
+    df: pd.DataFrame,
+    projects_dir: str,
+    services: PipelineServices | None = None,
+) -> pd.DataFrame:
     """
     Execute the batch PC extraction over a normalized input DataFrame.
 
@@ -151,6 +158,7 @@ def run_extraction_pipeline(df: pd.DataFrame, projects_dir: str) -> pd.DataFrame
       A new DataFrame with a populated `PC` column, preserving the current
       status/error semantics and multi-call expansion behavior.
     """
+    services = services or default_pipeline_services()
     _validate_input_df(df)
     df = _prepare_input_df(df)
 
@@ -167,6 +175,6 @@ def run_extraction_pipeline(df: pd.DataFrame, projects_dir: str) -> pd.DataFrame
     extra_rows: ExtraRows = []
 
     for req in _iter_requests(df):
-        _process_request(req, df, projects_dir, source_cache, extractor_cache, pc_cache, extra_rows)
+        _process_request(req, df, projects_dir, source_cache, extractor_cache, pc_cache, extra_rows, services)
 
     return _finalize_output_df(df, extra_rows)
