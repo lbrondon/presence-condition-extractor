@@ -30,11 +30,9 @@ from typing import Tuple
 
 from CSVHandler import CSVHandler
 from extraction_pipeline import run_extraction_pipeline
+from logging_config import configure_logging
 
-# -----------------------------------------------------------------------------
-# Logging
-# -----------------------------------------------------------------------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+configure_logging()
 
 
 # -----------------------------------------------------------------------------
