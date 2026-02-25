@@ -2,6 +2,7 @@ import re
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict
 
+from extraction_status import CALLER_NOT_FOUND, CALL_NOT_FOUND, TRUE
 
 # ----------------------------
 # Helpers: expression handling
@@ -48,7 +49,7 @@ def _neg(expr: str) -> str:
 def _and_all(parts: List[str]) -> str:
     parts = [p.strip() for p in parts if p and p.strip()]
     if not parts:
-        return "TRUE"
+        return TRUE
     if len(parts) == 1:
         return parts[0]
     return " && ".join(parts)
@@ -433,13 +434,13 @@ class PresenceConditionExtractor:
         """
         bounds = self._func_index.get(caller_name)
         if not bounds:
-            return ["CALLER_NOT_FOUND"]
+            return [CALLER_NOT_FOUND]
 
         start, end = bounds
         call_lines = self._find_calls_within_bounds(callee_name, start, end)
 
         if not call_lines:
-            return ["CALL_NOT_FOUND"]
+            return [CALL_NOT_FOUND]
 
         return [self._pc_at_line[ln] for ln in call_lines]
 
@@ -455,7 +456,7 @@ class PresenceConditionExtractor:
 
         Directive parsing supports multiline directives with trailing backslashes.
         """
-        pc_at_line: List[str] = ["TRUE"] * len(self.source_lines)
+        pc_at_line: List[str] = [TRUE] * len(self.source_lines)
 
         active_stack: List[str] = []     # stack of active expressions (already exclusive)
         frame_stack: List[_CondFrame] = []  # frames for each #if nesting
@@ -517,7 +518,7 @@ class PresenceConditionExtractor:
                     # Exclusive condition: (!E1 && !E2 && ...) && base
                     prev_bases = frame_stack[-1].branches_seen
                     excl_prefix = _and_all([_neg(e) for e in prev_bases])
-                    excl = base if excl_prefix == "TRUE" else f"{excl_prefix} && {base}"
+                    excl = base if excl_prefix == TRUE else f"{excl_prefix} && {base}"
 
                     # Replace top active expression (current branch) with new excl expression
                     active_stack.pop()

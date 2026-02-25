@@ -8,6 +8,7 @@ import pandas as pd
 
 from PresenceConditionExtractor import PresenceConditionExtractor
 from SourceCodeAnalyzer import SourceCodeAnalyzer
+from extraction_status import CALL_NOT_FOUND, FILE_NOT_FOUND, UNDEFINED
 from path_resolver import is_regular_file, resolve_source_path
 
 
@@ -45,7 +46,7 @@ def _prepare_input_df(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
     # Initialize output column
-    df["PC"] = "UNDEFINED"
+    df["PC"] = UNDEFINED
 
     # Drop pseudo-callee noise early (keeps output cleaner and faster)
     before_drop = len(df)
@@ -74,7 +75,7 @@ def _get_cached_pcs(
         if isinstance(pcs, str):
             pcs = [pcs]
         if not pcs:
-            pcs = ["CALL_NOT_FOUND"]
+            pcs = [CALL_NOT_FOUND]
         pc_cache[cache_key] = pcs
     return pc_cache[cache_key]
 
@@ -119,7 +120,7 @@ def _process_request(
 
     if not abs_path or not is_regular_file(abs_path):
         logging.error(f"File not found (after resolution attempts): {req.project} :: {req.file_field}")
-        df.at[req.idx, "PC"] = "FILE_NOT_FOUND"
+        df.at[req.idx, "PC"] = FILE_NOT_FOUND
         return
 
     # Load source (cached)
@@ -128,7 +129,7 @@ def _process_request(
             analyzer = SourceCodeAnalyzer(abs_path)
         except IsADirectoryError:
             logging.error(f"Path is a directory (skipping): {abs_path}")
-            df.at[req.idx, "PC"] = "FILE_NOT_FOUND"
+            df.at[req.idx, "PC"] = FILE_NOT_FOUND
             return
         source_cache[abs_path] = analyzer.source_code
 
