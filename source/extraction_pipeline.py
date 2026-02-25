@@ -23,22 +23,14 @@ def _is_pseudo_callee(callee: str) -> bool:
     return callee.strip().lower() in {"defined"}
 
 
-def run_extraction_pipeline(df: pd.DataFrame, projects_dir: str) -> pd.DataFrame:
-    """
-    Execute the batch PC extraction over a normalized input DataFrame.
-
-    Expected input columns:
-      Project, File, Caller, Callee
-
-    Returns:
-      A new DataFrame with a populated `PC` column, preserving the current
-      status/error semantics and multi-call expansion behavior.
-    """
+def _validate_input_df(df: pd.DataFrame) -> None:
     required_cols = ["Project", "File", "Caller", "Callee"]
     for col in required_cols:
         if col not in df.columns:
             raise KeyError(f"Missing required column in CSV: {col}")
 
+
+def _prepare_input_df(df: pd.DataFrame) -> pd.DataFrame:
     # Work on a copy to avoid mutating the caller's DataFrame unexpectedly.
     df = df.copy()
 
@@ -51,6 +43,56 @@ def run_extraction_pipeline(df: pd.DataFrame, projects_dir: str) -> pd.DataFrame
     df.reset_index(drop=True, inplace=True)
     if len(df) != before_drop:
         logging.info(f"Dropped {before_drop - len(df)} pseudo-callee/noise rows.")
+
+    return df
+
+
+def _get_cached_pcs(
+    abs_path: str,
+    caller: str,
+    callee: str,
+    source_cache: Dict[str, str],
+    extractor_cache: Dict[str, PresenceConditionExtractor],
+    pc_cache: Dict[Tuple[str, str, str], List[str]],
+) -> List[str]:
+    cache_key = (abs_path, caller, callee)
+    if cache_key not in pc_cache:
+        if abs_path not in extractor_cache:
+            extractor_cache[abs_path] = PresenceConditionExtractor(source_cache[abs_path])
+        extractor = extractor_cache[abs_path]
+        pcs = extractor.extract_pc_from_caller_context(caller, callee)
+        if isinstance(pcs, str):
+            pcs = [pcs]
+        if not pcs:
+            pcs = ["CALL_NOT_FOUND"]
+        pc_cache[cache_key] = pcs
+    return pc_cache[cache_key]
+
+
+def _finalize_output_df(df: pd.DataFrame, extra_rows: List[pd.Series]) -> pd.DataFrame:
+    # Append extra rows (multi-call expansion)
+    if extra_rows:
+        df = pd.concat([df, pd.DataFrame(extra_rows)], ignore_index=True)
+
+    # De-duplicate final output
+    df.drop_duplicates(subset=["Project", "File", "Caller", "Callee", "PC"], inplace=True, keep="first")
+    df.reset_index(drop=True, inplace=True)
+    return df
+
+
+def run_extraction_pipeline(df: pd.DataFrame, projects_dir: str) -> pd.DataFrame:
+    """
+    Execute the batch PC extraction over a normalized input DataFrame.
+
+    Expected input columns:
+      Project, File, Caller, Callee
+
+    Returns:
+      A new DataFrame with a populated `PC` column, preserving the current
+      status/error semantics and multi-call expansion behavior.
+    """
+    _validate_input_df(df)
+    df = _prepare_input_df(df)
 
     # Cache loaded source code per absolute file path (big speedup in large datasets)
     source_cache: Dict[str, str] = {}
@@ -90,19 +132,7 @@ def run_extraction_pipeline(df: pd.DataFrame, projects_dir: str) -> pd.DataFrame
                 continue
             source_cache[abs_path] = analyzer.source_code
 
-        cache_key = (abs_path, caller, callee)
-        if cache_key not in pc_cache:
-            if abs_path not in extractor_cache:
-                extractor_cache[abs_path] = PresenceConditionExtractor(source_cache[abs_path])
-            extractor = extractor_cache[abs_path]
-            pcs = extractor.extract_pc_from_caller_context(caller, callee)
-            if isinstance(pcs, str):
-                pcs = [pcs]
-            if not pcs:
-                pcs = ["CALL_NOT_FOUND"]
-            pc_cache[cache_key] = pcs
-
-        pcs = pc_cache[cache_key]
+        pcs = _get_cached_pcs(abs_path, caller, callee, source_cache, extractor_cache, pc_cache)
 
         # First PC in the original row
         df.at[idx, "PC"] = pcs[0]
@@ -113,12 +143,4 @@ def run_extraction_pipeline(df: pd.DataFrame, projects_dir: str) -> pd.DataFrame
             new_row["PC"] = pc
             extra_rows.append(new_row)
 
-    # Append extra rows (multi-call expansion)
-    if extra_rows:
-        df = pd.concat([df, pd.DataFrame(extra_rows)], ignore_index=True)
-
-    # De-duplicate final output
-    df.drop_duplicates(subset=["Project", "File", "Caller", "Callee", "PC"], inplace=True, keep="first")
-    df.reset_index(drop=True, inplace=True)
-
-    return df
+    return _finalize_output_df(df, extra_rows)
