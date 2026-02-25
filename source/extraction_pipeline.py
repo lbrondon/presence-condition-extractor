@@ -8,8 +8,8 @@ import pandas as pd
 from PresenceConditionExtractor import PresenceConditionExtractor
 from extraction_status import CALL_NOT_FOUND, FILE_NOT_FOUND, UNDEFINED
 from models import ExtractionRequest, PcCacheKey, PresenceConditions
-from path_resolver import is_regular_file, resolve_source_path
 from source_loader import load_source_code
+from source_path_service import resolve_existing_source_path
 
 SourceCache = Dict[str, str]
 ExtractorCache = Dict[str, PresenceConditionExtractor]
@@ -109,12 +109,12 @@ def _process_request(
     pc_cache: PcCache,
     extra_rows: ExtraRows,
 ) -> None:
-    abs_path = resolve_source_path(projects_dir, req.project, req.file_field)
+    abs_path = resolve_existing_source_path(projects_dir, req.project, req.file_field)
     logging.info(
         f"Processing file: {abs_path or '[NOT FOUND]'}, Caller: {req.caller}, Callee: {req.callee}"
     )
 
-    if not abs_path or not is_regular_file(abs_path):
+    if not abs_path:
         logging.error(f"File not found (after resolution attempts): {req.project} :: {req.file_field}")
         df.at[req.idx, "PC"] = FILE_NOT_FOUND
         return
