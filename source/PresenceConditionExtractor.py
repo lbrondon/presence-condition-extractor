@@ -10,6 +10,12 @@ from extraction_status import CALLER_NOT_FOUND, CALL_NOT_FOUND, TRUE
 
 _DEFINED_PAREN_RE = re.compile(r"\bdefined\s*\(\s*([A-Za-z_]\w*)\s*\)")
 _DEFINED_BARE_RE  = re.compile(r"\bdefined\s+([A-Za-z_]\w*)\b")
+_RE_DIRECTIVE_IF = re.compile(r"^\#\s*if\s+(.+)$")
+_RE_DIRECTIVE_IFDEF = re.compile(r"^\#\s*ifdef\s+([A-Za-z_]\w*)\s*$")
+_RE_DIRECTIVE_IFNDEF = re.compile(r"^\#\s*ifndef\s+([A-Za-z_]\w*)\s*$")
+_RE_DIRECTIVE_ELIF = re.compile(r"^\#\s*elif\s+(.+)$")
+_RE_DIRECTIVE_ELSE = re.compile(r"^\#\s*else\b")
+_RE_DIRECTIVE_ENDIF = re.compile(r"^\#\s*endif\b")
 
 def _normalize_defined(expr: str) -> str:
     """
@@ -444,6 +450,7 @@ class PresenceConditionExtractor:
     def _initialize_internal_views(self) -> None:
         self._sanitized = _sanitize_c_text(self.source_code)
         self._san_lines = self._sanitized.splitlines()
+        self._call_pattern_cache: Dict[str, re.Pattern] = {}
 
     def _initialize_indexes(self) -> None:
         # Build function index once per file
@@ -531,27 +538,27 @@ class PresenceConditionExtractor:
         active_stack: List[str],
         frame_stack: List[_CondFrame],
     ) -> None:
-        if m := re.match(r"^\#\s*if\s+(.+)$", directive_text):
+        if m := _RE_DIRECTIVE_IF.match(directive_text):
             self._handle_if(m.group(1), active_stack, frame_stack)
             return
 
-        if m := re.match(r"^\#\s*ifdef\s+([A-Za-z_]\w*)\s*$", directive_text):
+        if m := _RE_DIRECTIVE_IFDEF.match(directive_text):
             self._handle_ifdef(m.group(1), active_stack, frame_stack)
             return
 
-        if m := re.match(r"^\#\s*ifndef\s+([A-Za-z_]\w*)\s*$", directive_text):
+        if m := _RE_DIRECTIVE_IFNDEF.match(directive_text):
             self._handle_ifndef(m.group(1), active_stack, frame_stack)
             return
 
-        if m := re.match(r"^\#\s*elif\s+(.+)$", directive_text):
+        if m := _RE_DIRECTIVE_ELIF.match(directive_text):
             self._handle_elif(m.group(1), active_stack, frame_stack)
             return
 
-        if re.match(r"^\#\s*else\b", directive_text):
+        if _RE_DIRECTIVE_ELSE.match(directive_text):
             self._handle_else(active_stack, frame_stack)
             return
 
-        if re.match(r"^\#\s*endif\b", directive_text):
+        if _RE_DIRECTIVE_ENDIF.match(directive_text):
             self._handle_endif(active_stack, frame_stack)
             return
 
@@ -644,8 +651,12 @@ class PresenceConditionExtractor:
         return callee in self._NON_CALL_KEYWORDS
 
     def _build_call_pattern(self, callee: str) -> re.Pattern:
-        # Quick regex for identifier + '('
-        return re.compile(rf"\b{re.escape(callee)}\s*\(")
+        # Quick regex for identifier + '(' ; cached per callee within this file extractor.
+        pattern = self._call_pattern_cache.get(callee)
+        if pattern is None:
+            pattern = re.compile(rf"\b{re.escape(callee)}\s*\(")
+            self._call_pattern_cache[callee] = pattern
+        return pattern
 
     def _is_preprocessor_line(self, line_idx: int) -> bool:
         return self.source_lines[line_idx].lstrip().startswith("#")
