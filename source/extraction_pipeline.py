@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import logging
 from typing import Dict, Iterator, List, Tuple
 
@@ -9,22 +8,13 @@ import pandas as pd
 from PresenceConditionExtractor import PresenceConditionExtractor
 from SourceCodeAnalyzer import SourceCodeAnalyzer
 from extraction_status import CALL_NOT_FOUND, FILE_NOT_FOUND, UNDEFINED
+from models import ExtractionRequest, PcCacheKey, PresenceConditions
 from path_resolver import is_regular_file, resolve_source_path
 
 SourceCache = Dict[str, str]
 ExtractorCache = Dict[str, PresenceConditionExtractor]
-PcCacheKey = Tuple[str, str, str]
-PcCache = Dict[PcCacheKey, List[str]]
+PcCache = Dict[PcCacheKey, PresenceConditions]
 ExtraRows = List[pd.Series]
-
-
-@dataclass(frozen=True)
-class _ExtractionRequest:
-    idx: int
-    project: str
-    file_field: str
-    caller: str
-    callee: str
 
 
 def _is_pseudo_callee(callee: str) -> bool:
@@ -97,11 +87,11 @@ def _finalize_output_df(df: pd.DataFrame, extra_rows: ExtraRows) -> pd.DataFrame
     return df
 
 
-def _iter_requests(df: pd.DataFrame) -> Iterator[_ExtractionRequest]:
+def _iter_requests(df: pd.DataFrame) -> Iterator[ExtractionRequest]:
     for idx, project_raw, file_raw, caller_raw, callee_raw in df[
         ["Project", "File", "Caller", "Callee"]
     ].itertuples(index=True, name=None):
-        yield _ExtractionRequest(
+        yield ExtractionRequest(
             idx=idx,
             project=str(project_raw).strip(),
             file_field=str(file_raw).strip(),
@@ -111,7 +101,7 @@ def _iter_requests(df: pd.DataFrame) -> Iterator[_ExtractionRequest]:
 
 
 def _process_request(
-    req: _ExtractionRequest,
+    req: ExtractionRequest,
     df: pd.DataFrame,
     projects_dir: str,
     source_cache: SourceCache,
