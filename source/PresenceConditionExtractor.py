@@ -249,6 +249,72 @@ def _skip_preprocessor_line(text: str, i: int) -> int:
     return n
 
 
+def _scan_post_params_to_body(text: str, after_params: int) -> Tuple[int, bool, bool]:
+    """
+    Scan tokens after a parameter list looking for the definition opener '{'
+    or a terminating ';' (prototype/declaration).
+
+    Returns:
+      (cursor, saw_lbrace, saw_semicolon)
+    """
+    n = len(text)
+    t = after_params
+    saw_semicolon = False
+    saw_lbrace = False
+
+    while t < n:
+        t = _skip_ws(text, t)
+        if t >= n:
+            break
+
+        if text[t] == ";":
+            saw_semicolon = True
+            t += 1
+            break
+
+        if text[t] == "{":
+            saw_lbrace = True
+            break
+
+        # Skip attribute/macro tokens: IDENT [ ( ... ) ] possibly repeated
+        tok, t2 = _parse_ident(text, t)
+        if tok:
+            t = _skip_ws(text, t2)
+            if t < n and text[t] == "(":
+                t = _skip_balanced_parens(text, t)
+            continue
+
+        if text[t] == "(":
+            t = _skip_balanced_parens(text, t)
+            continue
+
+        t += 1
+
+    return t, saw_lbrace, saw_semicolon
+
+
+def _find_matching_body_end(text: str, body_start_idx: int) -> int:
+    """
+    Return the index of the matching closing brace for a function body that starts at '{',
+    or -1 if no matching brace is found.
+    """
+    n = len(text)
+    depth = 0
+    p = body_start_idx
+    while p < n:
+        if text[p] == "#":
+            p = _skip_preprocessor_line(text, p)
+            continue
+        if text[p] == "{":
+            depth += 1
+        elif text[p] == "}":
+            depth -= 1
+            if depth == 0:
+                return p
+        p += 1
+    return -1
+
+
 def _build_function_index(sanitized_text: str) -> Dict[str, Tuple[int, int]]:
     """
     Build a mapping func_name -> (start_line, end_line) for function *definitions*.
@@ -320,40 +386,7 @@ def _build_function_index(sanitized_text: str) -> Dict[str, Tuple[int, int]]:
         #   - macros with parentheses: CURL_ATTR_NONNULL(...)
         #   - qualifiers: const, noexcept (C++), etc.
         # We'll conservatively skip sequences of IDENT and balanced parens groups.
-        t = after_params
-        saw_semicolon = False
-        saw_lbrace = False
-
-        while t < n:
-            t = _skip_ws(text, t)
-            if t >= n:
-                break
-
-            if text[t] == ";":
-                saw_semicolon = True
-                t += 1
-                break
-
-            if text[t] == "{":
-                saw_lbrace = True
-                break
-
-            # Skip attribute/macro tokens: IDENT [ ( ... ) ] possibly repeated
-            tok, t2 = _parse_ident(text, t)
-            if tok:
-                t = _skip_ws(text, t2)
-                # if followed by '(' -> skip balanced group (attributes/macros)
-                if t < n and text[t] == "(":
-                    t = _skip_balanced_parens(text, t)
-                continue
-
-            # If we see '(' directly (rare), skip it
-            if text[t] == "(":
-                t = _skip_balanced_parens(text, t)
-                continue
-
-            # Other tokens (e.g., '*', ',', etc.) - advance
-            t += 1
+        t, saw_lbrace, saw_semicolon = _scan_post_params_to_body(text, after_params)
 
         # We only accept if we found '{' before ';'
         if (not saw_lbrace) or saw_semicolon:
@@ -363,26 +396,15 @@ def _build_function_index(sanitized_text: str) -> Dict[str, Tuple[int, int]]:
         # We found a function definition for func_name starting at i (line)
         start_line = _idx_to_line(line_starts, i)
 
-        # Now find the end by matching braces starting from the '{'
         body_i = t
-        depth = 0
-        p = body_i
-        while p < n:
-            if text[p] == "#":
-                p = _skip_preprocessor_line(text, p)
-                continue
-            if text[p] == "{":
-                depth += 1
-            elif text[p] == "}":
-                depth -= 1
-                if depth == 0:
-                    end_line = _idx_to_line(line_starts, p)
-                    functions[func_name] = (start_line, end_line)
-                    p += 1
-                    break
-            p += 1
+        body_end = _find_matching_body_end(text, body_i)
+        if body_end != -1:
+            end_line = _idx_to_line(line_starts, body_end)
+            functions[func_name] = (start_line, end_line)
+            i = body_end + 1
+            continue
 
-        i = p
+        i = body_i
         continue
 
     return functions

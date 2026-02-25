@@ -130,6 +130,38 @@ class PresenceConditionExtractorTests(unittest.TestCase):
         extractor = PresenceConditionExtractor(src)
         self.assertEqual(extractor.extract_pc_from_caller_context("caller", "if"), ["CALL_NOT_FOUND"])
 
+    def test_finds_caller_with_multiline_signature_and_macro_attribute(self):
+        src = (
+            "#define ATTR(x)\n"
+            "void callee(void) {}\n"
+            "static int\n"
+            "caller(\n"
+            "    int a,\n"
+            "    int b\n"
+            ") ATTR((unused))\n"
+            "{\n"
+            "  callee();\n"
+            "  return a + b;\n"
+            "}\n"
+        )
+        extractor = PresenceConditionExtractor(src)
+        self.assertEqual(extractor.extract_pc_from_caller_context("caller", "callee"), ["TRUE"])
+
+    def test_function_bounds_ignore_braces_in_comments_and_strings(self):
+        src = (
+            "void callee(void) {}\n"
+            "int caller(void) {\n"
+            "  /* fake brace: { */\n"
+            "  const char *s = \"not a real } brace\";\n"
+            "  callee();\n"
+            "  return 0;\n"
+            "}\n"
+            "int other(void) { return 1; }\n"
+        )
+        extractor = PresenceConditionExtractor(src)
+        self.assertEqual(extractor.extract_pc_from_caller_context("caller", "callee"), ["TRUE"])
+        self.assertEqual(extractor.extract_pc_from_caller_context("other", "callee"), ["CALL_NOT_FOUND"])
+
 
 if __name__ == "__main__":
     unittest.main()
