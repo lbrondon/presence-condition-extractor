@@ -409,6 +409,9 @@ class PresenceConditionExtractor:
     The returned PC for a call site is the conjunction of all active conditional
     expressions from outer to inner directives. If none applies, PC is TRUE.
     """
+    _NON_CALL_KEYWORDS = {
+        "if", "for", "while", "switch", "return", "sizeof", "typeof", "alignof"
+    }
 
     def __init__(self, source_code: str):
         self.source_code = source_code
@@ -600,27 +603,33 @@ class PresenceConditionExtractor:
         It intentionally includes macro-like calls (e.g., DEBUGASSERT(...)).
         It ignores preprocessor lines.
         """
-        # Quick regex for identifier + '('
-        pattern = re.compile(rf"\b{re.escape(callee)}\s*\(")
-
-        # Exclude obvious non-call keywords that also use '('
-        keywords = {
-            "if", "for", "while", "switch", "return", "sizeof", "typeof", "alignof"
-        }
-        if callee in keywords:
+        if self._is_non_call_keyword(callee):
             # If a CSV lists a keyword as callee, treat as not found
             return []
 
+        pattern = self._build_call_pattern(callee)
         hits: List[int] = []
         for ln in range(start, end + 1):
-            raw = self.source_lines[ln].lstrip()
-            if raw.startswith("#"):
+            if self._is_preprocessor_line(ln):
                 continue
 
-            # Use sanitized line to avoid matching inside comments/strings
-            sline = self._san_lines[ln] if ln < len(self._san_lines) else self.source_lines[ln]
-
-            for _ in pattern.finditer(sline):
+            for _ in pattern.finditer(self._line_for_call_matching(ln)):
                 hits.append(ln)
 
         return hits
+
+    def _is_non_call_keyword(self, callee: str) -> bool:
+        return callee in self._NON_CALL_KEYWORDS
+
+    def _build_call_pattern(self, callee: str) -> re.Pattern:
+        # Quick regex for identifier + '('
+        return re.compile(rf"\b{re.escape(callee)}\s*\(")
+
+    def _is_preprocessor_line(self, line_idx: int) -> bool:
+        return self.source_lines[line_idx].lstrip().startswith("#")
+
+    def _line_for_call_matching(self, line_idx: int) -> str:
+        # Use sanitized line to avoid matching inside comments/strings
+        if line_idx < len(self._san_lines):
+            return self._san_lines[line_idx]
+        return self.source_lines[line_idx]

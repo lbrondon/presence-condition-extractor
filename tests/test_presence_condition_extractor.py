@@ -106,6 +106,30 @@ class PresenceConditionExtractorTests(unittest.TestCase):
         extractor = PresenceConditionExtractor(src)
         self.assertEqual(extractor.extract_pc_from_caller_context("caller", "callee"), ["OUTER && !(INNER)"])
 
+    def test_finds_function_with_attribute_after_signature(self):
+        src = (
+            "void callee(void) {}\n"
+            "int caller(void) __attribute__((unused))\n"
+            "{\n"
+            "  callee();\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        extractor = PresenceConditionExtractor(src)
+        self.assertEqual(extractor.extract_pc_from_caller_context("caller", "callee"), ["TRUE"])
+
+    def test_treats_keyword_callee_as_not_found(self):
+        src = (
+            "int caller(void) {\n"
+            "  if (1) {\n"
+            "    return 1;\n"
+            "  }\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        extractor = PresenceConditionExtractor(src)
+        self.assertEqual(extractor.extract_pc_from_caller_context("caller", "if"), ["CALL_NOT_FOUND"])
+
 
 if __name__ == "__main__":
     unittest.main()
