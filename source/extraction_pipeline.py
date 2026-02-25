@@ -6,10 +6,10 @@ from typing import Dict, Iterator, List, Tuple
 import pandas as pd
 
 from PresenceConditionExtractor import PresenceConditionExtractor
-from SourceCodeAnalyzer import SourceCodeAnalyzer
 from extraction_status import CALL_NOT_FOUND, FILE_NOT_FOUND, UNDEFINED
 from models import ExtractionRequest, PcCacheKey, PresenceConditions
 from path_resolver import is_regular_file, resolve_source_path
+from source_loader import load_source_code
 
 SourceCache = Dict[str, str]
 ExtractorCache = Dict[str, PresenceConditionExtractor]
@@ -122,12 +122,11 @@ def _process_request(
     # Load source (cached)
     if abs_path not in source_cache:
         try:
-            analyzer = SourceCodeAnalyzer(abs_path)
+            source_cache[abs_path] = load_source_code(abs_path)
         except IsADirectoryError:
             logging.error(f"Path is a directory (skipping): {abs_path}")
             df.at[req.idx, "PC"] = FILE_NOT_FOUND
             return
-        source_cache[abs_path] = analyzer.source_code
 
     pcs = _get_cached_pcs(abs_path, req.caller, req.callee, source_cache, extractor_cache, pc_cache)
 
