@@ -31,6 +31,7 @@ from typing import Tuple
 from CSVHandler import CSVHandler
 from extraction_pipeline import run_extraction_pipeline
 from logging_config import configure_logging
+from streaming_extraction import stream_extraction_to_csv
 
 configure_logging()
 
@@ -73,6 +74,35 @@ def main() -> None:
     parser.add_argument("--projects", default=projects_dir_default, help="Directory containing all projects.")
     parser.add_argument("--output", default=os.path.join(output_dir_default, "57_cs_projects_with_pc.csv"),
                         help="Output CSV path.")
+    parser.add_argument(
+        "--execution-mode",
+        choices=("stream", "in-memory"),
+        default="stream",
+        help="Use streaming mode to reduce peak memory (default) or in-memory mode.",
+    )
+    parser.add_argument(
+        "--ingest-chunk-size",
+        type=int,
+        default=100_000,
+        help="Rows per CSV chunk while reading input in streaming mode.",
+    )
+    parser.add_argument(
+        "--process-batch-size",
+        type=int,
+        default=50_000,
+        help="Rows per processing batch after optional on-disk deduplication.",
+    )
+    parser.add_argument(
+        "--progress-every",
+        type=int,
+        default=10_000,
+        help="Log progress every N requests within each batch (0 disables).",
+    )
+    parser.add_argument(
+        "--disable-request-dedup",
+        action="store_true",
+        help="Disable on-disk deduplication of (Project, File, Caller, Callee) requests in streaming mode.",
+    )
     args = parser.parse_args()
 
     input_csv_path = args.input
@@ -85,12 +115,22 @@ def main() -> None:
     logging.info(f"Projects dir: {projects_dir}")
     logging.info(f"Output CSV: {output_csv_path}")
 
-    csv_handler = CSVHandler(input_csv_path)
-    df = csv_handler.load_csv()
-    df = run_extraction_pipeline(df, projects_dir)
-
-    csv_handler.dataframe = df
-    csv_handler.save_csv(output_csv_path)
+    if args.execution_mode == "in-memory":
+        csv_handler = CSVHandler(input_csv_path)
+        df = csv_handler.load_csv()
+        df = run_extraction_pipeline(df, projects_dir, progress_every=args.progress_every)
+        csv_handler.dataframe = df
+        csv_handler.save_csv(output_csv_path)
+    else:
+        stream_extraction_to_csv(
+            input_csv_path=input_csv_path,
+            output_csv_path=output_csv_path,
+            projects_dir=projects_dir,
+            ingest_chunk_size=args.ingest_chunk_size,
+            process_batch_size=args.process_batch_size,
+            progress_every=args.progress_every,
+            deduplicate_requests=not args.disable_request_dedup,
+        )
 
     logging.info("Extraction completed successfully.")
 

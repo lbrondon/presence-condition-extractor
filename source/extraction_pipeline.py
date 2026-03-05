@@ -111,7 +111,7 @@ def _process_request(
     services: PipelineServices,
 ) -> None:
     abs_path = services.resolve_existing_source_path(projects_dir, req.project, req.file_field)
-    logging.info(
+    logging.debug(
         f"Processing file: {abs_path or '[NOT FOUND]'}, Caller: {req.caller}, Callee: {req.callee}"
     )
 
@@ -147,6 +147,7 @@ def run_extraction_pipeline(
     df: pd.DataFrame,
     projects_dir: str,
     services: PipelineServices | None = None,
+    progress_every: int = 0,
 ) -> pd.DataFrame:
     """
     Execute the batch PC extraction over a normalized input DataFrame.
@@ -174,7 +175,9 @@ def run_extraction_pipeline(
     # Collect extra rows when a caller contains multiple call sites for the same callee
     extra_rows: ExtraRows = []
 
-    for req in _iter_requests(df):
+    for processed, req in enumerate(_iter_requests(df), start=1):
         _process_request(req, df, projects_dir, source_cache, extractor_cache, pc_cache, extra_rows, services)
+        if progress_every > 0 and (processed % progress_every == 0):
+            logging.info(f"Processed {processed} requests in current batch.")
 
     return _finalize_output_df(df, extra_rows)
